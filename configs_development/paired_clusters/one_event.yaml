@@ -1,0 +1,9 @@
+events: 1
+threads: 1
+seed: 12345
+digi: true
+reco: false
+spacepoints: false
+output_measurements_root: true
+output_cells_csv: true
+digi_config: scripts/simulation/odd-full-geo-digi-config.json

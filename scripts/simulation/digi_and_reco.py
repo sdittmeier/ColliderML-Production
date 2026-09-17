@@ -129,6 +129,7 @@ def setup_acts_reconstruction(input_path, output_dir, config, rnd, logger=None):
     output_particles_root = getattr(config, "output_particles_root", False)
     output_simhits_root = getattr(config, "output_simhits_root", False)
     output_measurements_root = getattr(config, "output_measurements_root", False)
+    output_cells_csv = getattr(config, "output_cells_csv", False)
     output_seeds_root = getattr(config, "output_seeds_root", False)
     output_spacepoints_root = getattr(config, "output_spacepoints_root", False)
 
@@ -259,6 +260,7 @@ def setup_acts_reconstruction(input_path, output_dir, config, rnd, logger=None):
         logger.info("Adding digitization")
         # ROOT output for digitized measurements (purely controlled by config flag)
         measurements_root_dir = output_dir if output_measurements_root else None
+        cells_csv_dir = output_dir / "csv" if output_cells_csv else None
 
         addDigitization(
             s,
@@ -266,7 +268,7 @@ def setup_acts_reconstruction(input_path, output_dir, config, rnd, logger=None):
             field,
             digiConfigFile=oddDigiConfig,
             outputDirRoot=measurements_root_dir,
-            outputDirCsv=None,
+            outputDirCsv=cells_csv_dir,
             rnd=rnd,
             logLevel=LOG_LEVEL,
         )

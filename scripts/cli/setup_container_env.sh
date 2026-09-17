@@ -33,6 +33,7 @@ if [ ! -d "$SPACK_BASE" ]; then
 fi
 
 # --- 0a. Install bc (required by MadGraph for shower parameter calculation) ---
+if [ "${SKIP_GENERATION_SETUP:-}" != "1" ]; then
 if ! command -v bc &>/dev/null; then
     if [ -f "$CACHE_DIR/bc_"*.deb ]; then
         dpkg -i "$CACHE_DIR"/bc_*.deb 2>/dev/null \
@@ -97,6 +98,9 @@ if [ -n "$_mg_dir" ] && [ ! -f "$_mg_dir/HEPTools/MG5aMC_PY8_interface/MG5aMC_PY
     unset _hepmc2_dir _py8_dir _zlib_dir
 fi
 unset _mg_dir
+else
+    echo "Skipping MadGraph/Pythia generation setup."
+fi
 
 # --- 1. Source .bashrc for PATH and CMAKE_PREFIX_PATH ---
 # The container's .bashrc sets up PATH and CMAKE_PREFIX_PATH for all spack
@@ -232,7 +236,7 @@ if [ -f "$_odd_src/CMakeLists.txt" ] && [ ! -f "$_odd_install/lib/libOpenDataDet
     rm -rf "$_odd_build" && mkdir -p "$_odd_build"
     if (cd "$_odd_build" && \
         cmake "$_odd_src" -DCMAKE_INSTALL_PREFIX="$_odd_install" 2>/dev/null && \
-        make -j"$(nproc)" 2>/dev/null && \
+        make -j"${ODD_BUILD_JOBS:-2}" 2>/dev/null && \
         make install 2>/dev/null); then
         echo "ODD factory library built successfully."
     else
@@ -250,7 +254,9 @@ fi
 # --- 9. Geant4 physics datasets ---
 # Required for detector simulation. ~2 GB download, cached in CACHE_DIR.
 _g4_data_dir=$(ls -d "$SPACK_BASE"/geant4-*/share/Geant4/data 2>/dev/null | head -1)
-if [ -n "$_g4_data_dir" ] && [ -z "$(ls -A "$_g4_data_dir" 2>/dev/null)" ]; then
+if [ "${SKIP_G4_DOWNLOAD:-}" = "1" ]; then
+    echo "Skipping Geant4 datasets (not needed for EDM4hep digitization)."
+elif [ -n "$_g4_data_dir" ] && [ -z "$(ls -A "$_g4_data_dir" 2>/dev/null)" ]; then
     # Data directory exists but is empty — need to download
     if [ -d "$CACHE_DIR/g4data" ] && [ -n "$(ls -A "$CACHE_DIR/g4data" 2>/dev/null)" ]; then
         # Cached data exists — symlink each dataset
@@ -262,9 +268,8 @@ if [ -n "$_g4_data_dir" ] && [ -z "$(ls -A "$_g4_data_dir" 2>/dev/null)" ]; then
         done
     else
         echo "Geant4 datasets not found. Downloading (~2 GB)..."
-        echo "  (Set SKIP_G4_DOWNLOAD=1 to skip if running without network access)"
         mkdir -p "$CACHE_DIR/g4data"
-        if [ "${SKIP_G4_DOWNLOAD:-}" != "1" ] && timeout 600 download_geant4_datasets.sh 2>/dev/null; then
+        if timeout 600 download_geant4_datasets.sh 2>/dev/null; then
             # Move downloaded data to cache and symlink
             for dataset in "$_g4_data_dir"/*/; do
                 _name=$(basename "$dataset")
@@ -284,7 +289,9 @@ fi
 # --- 10. Python packages for postprocessing ---
 # Install packages needed by convert_all.py and other postprocessing scripts.
 _pip_target="$CACHE_DIR/pip"
-if [ -d "$CACHE_DIR" ]; then
+if [ "${SKIP_POSTPROCESSING_DEPS:-}" = "1" ]; then
+    echo "Skipping postprocessing Python packages."
+elif [ -d "$CACHE_DIR" ]; then
     # Always add pip target to PYTHONPATH first (may already be populated from cache)
     if [ -d "$_pip_target" ]; then
         export PYTHONPATH="$_pip_target:$PYTHONPATH"
