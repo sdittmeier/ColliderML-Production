@@ -1,0 +1,15 @@
+campaign: full_pileup
+dataset: ttbar
+version: v1
+common:
+  output_base_dir: /output/paired-conversion
+input_base_dir: /output/paired-conversion-input/pu200
+h5_output_dir: /output/paired-conversion
+objects:
+  - particles
+  - tracker_hits
+output_format: parquet
+run_size: 1
+chunk_size: 1
+max_chunks: 1
+log_level: INFO

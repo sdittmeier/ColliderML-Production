@@ -234,7 +234,9 @@ def build_particles_df_with_parents_and_vertex(
             if "event_id" not in particles_root_df.columns and "event_nr" in particles_root_df.columns:
                 particles_root_df = particles_root_df.rename(columns={"event_nr": "event_id"})
             ev_digi = particles_root_df[particles_root_df.get("event_id", -1) == local_event_num]
-        print("Particles event: ", local_event_num, ev_parts.shape, ev_digi.shape)
+        logger.debug("Particles event %s: EDM4hep shape=%s, ACTS shape=%s",
+                     local_event_num, ev_parts.shape,
+                     ev_digi.shape if ev_digi is not None else None)
         ev_df = process_event_for_particles(
             event_id=local_event_num,
             local_event_num=local_event_num,
