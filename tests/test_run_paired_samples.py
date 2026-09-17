@@ -78,6 +78,7 @@ class PairedPipelineTest(unittest.TestCase):
 
         self.assertEqual(result["events_per_sample"], 2)
         self.assertEqual(len(commands), 6)
+        self.assertEqual(sum("--simhits-root" in command for command in commands), 2)
         for sample in ("pu0", "pu200"):
             config_path = self.args.output / f"_convert_{sample}.json"
             config = json.loads(config_path.read_text())

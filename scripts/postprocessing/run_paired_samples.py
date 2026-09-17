@@ -111,6 +111,7 @@ def run(args: argparse.Namespace) -> dict:
                     "--run", "0", "--acts-revision", acts_revision, "--odd-revision", odd_revision,
                     "--edm4hep", str(inputs[sample]), "--digi-config", str(args.digi_config),
                     "--measurements-root", str(acts_dir / "measurements.root"),
+                    "--simhits-root", str(acts_dir / "simhits.root"),
                     "--csv-dir", str(acts_dir / "csv"), "--converted-hits", str(converted_hits),
                     "--particles", str(particles), "--output", str(sample_dir))
         report = json.loads((sample_dir / "report.json").read_text())

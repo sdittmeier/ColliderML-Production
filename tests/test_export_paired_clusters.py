@@ -9,6 +9,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
@@ -180,6 +181,64 @@ class PairedClusterExportTest(unittest.TestCase):
         self.assertEqual((report["measurements"], report["cells"]), (4, 6))
         self.assertEqual([(hit["local_event"], hit["measurement_id"]) for hit in output_hits],
                          [(0, 0), (0, 1), (1, 0), (1, 1)])
+
+    def test_resolves_multiple_particles_per_measurement(self) -> None:
+        self.links = [dict(measurement_id=0, hit_id=0),
+                      dict(measurement_id=0, hit_id=1),
+                      dict(measurement_id=1, hit_id=2)]
+        self.write_inputs()
+        self.write_converted(labels=(None, 5))
+        self.args.simhits_root = self.base / "simhits.root"
+        with uproot.recreate(self.args.simhits_root) as root:
+            root["hits"] = {
+                "event_id": np.zeros(3, dtype=np.int32),
+                "tx": np.array([11, 12, 13], dtype=np.float32),
+                "ty": np.array([21, 22, 23], dtype=np.float32),
+                "tz": np.array([31, 32, 33], dtype=np.float32),
+                "barcode_vertex_primary": np.zeros(3, dtype=np.uint32),
+                "barcode_vertex_secondary": np.zeros(3, dtype=np.uint32),
+                "barcode_particle": np.array([4, 5, 5], dtype=np.uint32),
+                "barcode_generation": np.zeros(3, dtype=np.uint32),
+                "barcode_sub_particle": np.zeros(3, dtype=np.uint32),
+            }
+        edm_hits = [(11, 21, 31, 4), (12, 22, 32, 5), (13, 23, 33, 5)]
+        with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits):
+            report = exporter.export(self.args)
+        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        self.assertEqual([hit["particle_ids"] for hit in hits], [[4, 5], [5]])
+        self.assertEqual([hit["particle_id"] for hit in hits], [None, 5])
+        self.assertEqual(report["multi_particle_measurements"], 1)
+        self.assertEqual(report["null_particle_labels"], 1)
+
+    def test_barcode_fallback_resolves_missing_coordinate(self) -> None:
+        rows = [
+            {"tx": 1, "ty": 2, "tz": 3, "barcode_particle": 7},
+            {"tx": 4, "ty": 5, "tz": 6, "barcode_particle": 7},
+        ]
+        for row in rows:
+            row.update(barcode_vertex_primary=0, barcode_vertex_secondary=0,
+                       barcode_generation=0, barcode_sub_particle=0)
+        mapping, fallbacks = exporter.simhit_particle_map(0, rows, [(1, 2, 3, 42)], {0, 1})
+        self.assertEqual(mapping, {0: 42, 1: 42})
+        self.assertEqual(fallbacks, 1)
+
+    def test_rejects_conflicting_barcode_truth(self) -> None:
+        rows = [
+            {"tx": 1, "ty": 2, "tz": 3, "barcode_particle": 7},
+            {"tx": 4, "ty": 5, "tz": 6, "barcode_particle": 7},
+        ]
+        for row in rows:
+            row.update(barcode_vertex_primary=0, barcode_vertex_secondary=0,
+                       barcode_generation=0, barcode_sub_particle=0)
+        with self.assertRaisesRegex(ValueError, "conflicting EDM4hep particles"):
+            exporter.simhit_particle_map(0, rows, [(1, 2, 3, 42), (4, 5, 6, 43)], {0, 1})
+
+    def test_rejects_unresolved_simhit(self) -> None:
+        row = {"tx": 1, "ty": 2, "tz": 3, "barcode_particle": 7,
+               "barcode_vertex_primary": 0, "barcode_vertex_secondary": 0,
+               "barcode_generation": 0, "barcode_sub_particle": 0}
+        with self.assertRaisesRegex(ValueError, "no unambiguous EDM4hep particle"):
+            exporter.simhit_particle_map(0, [row], [], {0})
 
 
 if __name__ == "__main__":

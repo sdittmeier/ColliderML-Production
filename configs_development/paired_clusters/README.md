@@ -4,10 +4,16 @@ One command builds hits, constituent cells, and particles from the first N
 events of each hard-scatter and full-pileup EDM4hep file. N defaults to 1.
 ACTS digitization and the existing production particle/tracker-hit converter
 run on the same input events. The exporter checks their alignment before
-adding a single matched `particle_id` to each paired hit. It retains all
-`simhit_ids`, but the label is not complete truth for a merged pileup cluster.
-An unmatched label stays null rather than becoming particle ID zero.
+adding particle truth to each paired hit. It retains all `simhit_ids` and
+resolves them to the distinct `particle_ids` contributing
+to each measurement. The scalar `particle_id` is filled only when that list
+contains exactly one particle; a merged measurement with multiple particles
+has a null scalar label. An unresolved SimHit fails export rather than
+becoming particle ID zero.
+
 There is no cell-level particle label or track reconstruction.
+This run enables `simhits.root`, which the previous `paired-samples-n1` run did
+not write; use a new output directory, but reuse the downloaded EDM4hep files.
 
 ## One-time setup
 
@@ -49,7 +55,7 @@ sudo docker build -f docker/acts-arrow/Dockerfile \
 Start the container with the prepared cache and inputs:
 
 ```bash
-sudo docker run --rm -it --entrypoint /bin/bash \
+docker run --rm -it --entrypoint /bin/bash \
   -v "$CLUSTER_REPO":/workspace:ro \
   -v "$CLUSTER_ROOT/data":/data:ro \
   -v "$CLUSTER_SCRATCH/cache":/cache \
@@ -76,7 +82,7 @@ cd /workspace
 python3 -m unittest tests.test_paired_nullable_particle_id \
   tests.test_export_paired_clusters tests.test_run_paired_samples
 python3 /workspace/scripts/postprocessing/run_paired_samples.py \
-  --output /output/paired-samples-n1
+  --output /output/paired-samples-truth-n1
 ```
 
 For more events, use `--events N` and a **new** output directory, for example
@@ -106,7 +112,7 @@ import json
 from pathlib import Path
 import pyarrow.parquet as pq
 
-root = Path('/output/paired-samples-n1')
+root = Path('/output/paired-samples-truth-n1')
 summary = json.loads((root / 'complete.json').read_text())
 for sample in ('pu0', 'pu200'):
     folder = root / sample
@@ -117,26 +123,29 @@ for sample in ('pu0', 'pu200'):
     assert report['events'] == summary['events_per_sample'] == particles
     assert (hits, cells) == (report['measurements'], report['cells'])
     print(sample, 'events', particles, 'hits', hits, 'cells', cells,
-          'null labels', report['null_particle_labels'])
+          'multi-particle hits', report['multi_particle_measurements'],
+          'null scalar labels', report['null_particle_labels'])
 PY
 ```
 
 After exiting Docker, copy only the completed products to the home directory:
 
 ```bash
-mkdir -p "$CLUSTER_ROOT/exports/paired-samples-n1"
-cp -r "$CLUSTER_SCRATCH/output/paired-samples-n1/pu0" \
-      "$CLUSTER_SCRATCH/output/paired-samples-n1/pu200" \
-      "$CLUSTER_ROOT/exports/paired-samples-n1/"
-cp "$CLUSTER_SCRATCH/output/paired-samples-n1/complete.json" \
-   "$CLUSTER_ROOT/exports/paired-samples-n1/"
+mkdir -p "$CLUSTER_ROOT/exports/paired-samples-truth-n1"
+cp -r "$CLUSTER_SCRATCH/output/paired-samples-truth-n1/pu0" \
+      "$CLUSTER_SCRATCH/output/paired-samples-truth-n1/pu200" \
+      "$CLUSTER_ROOT/exports/paired-samples-truth-n1/"
+cp "$CLUSTER_SCRATCH/output/paired-samples-truth-n1/complete.json" \
+   "$CLUSTER_ROOT/exports/paired-samples-truth-n1/"
 ```
 
 Each sample directory contains `hits.parquet`, `cells.parquet`,
 `particles.parquet`, `report.json`, and the ACTS ROOT/CSV outputs under
 `acts/`. Hits and cells join on `(campaign, dataset, version, run,
 local_event, measurement_id)`; hit `particle_id` joins to the particle ID
-within the same event. Particle Parquet retains the production converter's
+within the same event, and every ID in `particle_ids` does likewise. The
+`simhit_ids` list retains the ACTS association evidence. Particle Parquet
+retains the production converter's
 one-row-per-event, list-column layout. Reports include source checksums and
 ACTS, ODD, and ColliderML-Production revisions.
 The particle table comes directly from EDM4hep; optional ACTS-derived fields
