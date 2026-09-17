@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import uproot
 
@@ -79,6 +80,18 @@ class PairedClusterExportTest(unittest.TestCase):
         write_csv(self.csv_dir / f"{self.prefix}measurement-simhit-map.csv",
                   list(self.links[0]), self.links)
 
+    def write_converted(self, labels=(4, 5)) -> None:
+        self.args.converted_hits = self.base / "converted_hits.parquet"
+        self.args.particles = self.base / "particles.parquet"
+        pq.write_table(pa.table({
+            "event_id": [0], "x": [[1.0, 4.0]], "y": [[2.0, 5.0]],
+            "z": [[3.0, 6.0]], "volume_id": [[16, 16]],
+            "layer_id": [[2, 2]], "surface_id": [[3, 3]],
+            "particle_id": [list(labels)],
+        }), self.args.converted_hits)
+        pq.write_table(pa.table({"event_id": [0], "particle_id": [[4, 5, 6]]}),
+                       self.args.particles)
+
     def test_preserves_multiple_contributors_and_cells(self) -> None:
         report = exporter.export(self.args)
         hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
@@ -101,6 +114,72 @@ class PairedClusterExportTest(unittest.TestCase):
         self.write_inputs()
         with self.assertRaisesRegex(ValueError, "cluster size mismatch"):
             exporter.export(self.args)
+
+    def test_adds_single_labels_and_copies_particles(self) -> None:
+        self.write_converted(labels=(4, None))
+        report = exporter.export(self.args)
+        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        self.assertEqual([hit["particle_id"] for hit in hits], [4, None])
+        self.assertEqual([hit["simhit_ids"] for hit in hits], [[7, 8], [9]])
+        self.assertEqual(report["null_particle_labels"], 1)
+        self.assertEqual(report["particles"], 3)
+        self.assertEqual((self.args.output / "particles.parquet").read_bytes(),
+                         self.args.particles.read_bytes())
+
+    def test_rejects_shuffled_converted_hit(self) -> None:
+        self.write_converted()
+        table = pq.read_table(self.args.converted_hits).to_pydict()
+        table["x"] = [[4.0, 1.0]]
+        pq.write_table(pa.table(table), self.args.converted_hits)
+        with self.assertRaisesRegex(ValueError, "converted position differs"):
+            exporter.export(self.args)
+        self.assertFalse(self.args.output.exists())
+
+    def test_rejects_unknown_particle_label(self) -> None:
+        self.write_converted(labels=(4, 99))
+        with self.assertRaisesRegex(ValueError, "absent from particles"):
+            exporter.export(self.args)
+        self.assertFalse(self.args.output.exists())
+
+    def test_rejects_missing_converted_event(self) -> None:
+        self.write_converted()
+        pq.write_table(pa.table({"event_id": [1], "particle_id": [[4, 5]]}),
+                       self.args.particles)
+        with self.assertRaisesRegex(ValueError, "missing converted hits or particles"):
+            exporter.export(self.args)
+
+    def test_two_events_keep_event_local_keys(self) -> None:
+        second = "event000000001-"
+        write_csv(self.csv_dir / f"{second}measurements.csv",
+                  list(self.measurements[0]), self.measurements)
+        write_csv(self.csv_dir / f"{second}cells.csv", list(self.cells[0]), self.cells)
+        write_csv(self.csv_dir / f"{second}measurement-simhit-map.csv",
+                  list(self.links[0]), self.links)
+        with uproot.recreate(self.args.measurements_root) as root:
+            root["measurements"] = {
+                "event_nr": np.array([0, 0, 1, 1], dtype=np.int32),
+                "volume_id": np.full(4, 16, dtype=np.int32),
+                "layer_id": np.full(4, 2, dtype=np.int32),
+                "surface_id": np.full(4, 3, dtype=np.int32),
+                "rec_gx": np.array([1, 4, 1, 4], dtype=np.float32),
+                "rec_gy": np.array([2, 5, 2, 5], dtype=np.float32),
+                "rec_gz": np.array([3, 6, 3, 6], dtype=np.float32),
+                "clus_size": np.array([2, 1, 2, 1], dtype=np.int32),
+            }
+        self.write_converted()
+        hits = pq.read_table(self.args.converted_hits).to_pydict()
+        particles = pq.read_table(self.args.particles).to_pydict()
+        for table in (hits, particles):
+            for name, values in table.items():
+                table[name] = values * 2 if name != "event_id" else [0, 1]
+        pq.write_table(pa.table(hits), self.args.converted_hits)
+        pq.write_table(pa.table(particles), self.args.particles)
+        report = exporter.export(self.args)
+        output_hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        self.assertEqual(report["events"], 2)
+        self.assertEqual((report["measurements"], report["cells"]), (4, 6))
+        self.assertEqual([(hit["local_event"], hit["measurement_id"]) for hit in output_hits],
+                         [(0, 0), (0, 1), (1, 0), (1, 1)])
 
 
 if __name__ == "__main__":

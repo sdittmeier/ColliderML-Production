@@ -125,6 +125,7 @@ def _process_chunk_for_all(
     time_max: float = 10.0,
     output_format: str = 'hdf5',
     row_group_size: int | None = None,
+    preserve_unmatched_particle_id: bool = False,
 ) -> None:
     chunk_start_time = time.time()
     logger.info(f"Starting chunk processing for events {start_event}-{end_event}")
@@ -465,7 +466,11 @@ def _process_chunk_for_all(
                 f"Tracker hits chunk events expected={expected_events}, processed={processed_events_hits}"
             )
         logger.info(f"Writing tracker hits to: {trkhits_out} (rows={len(digihits_all)})")
-        write_digihits_with_selection(digihits_all, str(trkhits_out), columns_keep=digihits_columns_keep, output_format=output_format, row_group_size=row_group_size)
+        write_digihits_with_selection(digihits_all, str(trkhits_out),
+                                     columns_keep=digihits_columns_keep,
+                                     output_format=output_format,
+                                     row_group_size=row_group_size,
+                                     preserve_unmatched_particle_id=preserve_unmatched_particle_id)
         if trkhits_out.exists():
             logger.info(f"Wrote tracker hits file: {trkhits_out}")
         else:
@@ -574,6 +579,7 @@ def convert_all(config: dict, chunk_index: int | None = None) -> None:
     time_max = calo_config.get("time_max", 10.0)
 
     row_group_size = config.get("row_group_size")  # None means PyArrow default (single row group)
+    preserve_unmatched_particle_id = bool(config.get("preserve_unmatched_particle_id", False))
 
     processing_start_time = time.time()
     
@@ -613,6 +619,7 @@ def convert_all(config: dict, chunk_index: int | None = None) -> None:
             time_max=time_max,
             output_format=output_format,
             row_group_size=row_group_size,
+            preserve_unmatched_particle_id=preserve_unmatched_particle_id,
         ),
     )
 
@@ -673,4 +680,4 @@ def main():
     logger.info(f"Total script execution time: {main_total_time:.2f}s")
 
 if __name__ == "__main__":
-    main() 
+    main()

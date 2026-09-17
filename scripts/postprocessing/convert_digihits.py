@@ -197,7 +197,8 @@ def process_event_for_digihits(event_id: int, local_event_num: int, measurements
     return event_measurements
 
 
-def build_parquet_digihits(df: pd.DataFrame, output_file: str, row_group_size: int | None = None) -> None:
+def build_parquet_digihits(df: pd.DataFrame, output_file: str, row_group_size: int | None = None,
+                          preserve_unmatched_particle_id: bool = False) -> None:
     """
     Write digitized measurements to Parquet format.
     
@@ -217,6 +218,7 @@ def build_parquet_digihits(df: pd.DataFrame, output_file: str, row_group_size: i
         compression='snappy',
         schema_overrides=DIGIHITS_PARQUET_TYPES,
         row_group_size=row_group_size,
+        nullable_integer_columns={"particle_id"} if preserve_unmatched_particle_id else None,
     )
 
 
@@ -226,6 +228,7 @@ def write_digihits_with_selection(
     columns_keep: List[str] | None = None,
     output_format: str = 'hdf5',
     row_group_size: int | None = None,
+    preserve_unmatched_particle_id: bool = False,
 ) -> None:
     """
     Write merged digi-hits DataFrame to HDF5 or Parquet with optional column selection.
@@ -252,7 +255,8 @@ def write_digihits_with_selection(
     
     # Route to appropriate writer based on format
     if output_format == 'parquet':
-        build_parquet_digihits(df, output_file, row_group_size=row_group_size)
+        build_parquet_digihits(df, output_file, row_group_size=row_group_size,
+                              preserve_unmatched_particle_id=preserve_unmatched_particle_id)
     else:  # default to hdf5
         build_hdf5_digihits(df, output_file)
 
@@ -583,5 +587,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

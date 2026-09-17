@@ -289,21 +289,19 @@ fi
 # --- 10. Python packages for postprocessing ---
 # Install packages needed by convert_all.py and other postprocessing scripts.
 _pip_target="$CACHE_DIR/pip"
-if [ "${SKIP_POSTPROCESSING_DEPS:-}" = "1" ]; then
-    echo "Skipping postprocessing Python packages."
-elif [ -d "$CACHE_DIR" ]; then
+if [ -d "$CACHE_DIR" ]; then
     # Always add pip target to PYTHONPATH first (may already be populated from cache)
     if [ -d "$_pip_target" ]; then
         export PYTHONPATH="$_pip_target:$PYTHONPATH"
     fi
     # Install if not yet available
-    if ! python3 -c "import pyarrow" 2>/dev/null; then
+    if ! python3 -c "import pyarrow, pyedm4hep, pandas, uproot, yaml" 2>/dev/null; then
         echo "Installing Python packages for postprocessing..."
         mkdir -p "$_pip_target"
         timeout 180 python3 -m pip install --quiet --timeout 15 \
             --trusted-host pypi.org --trusted-host files.pythonhosted.org \
             --target="$_pip_target" \
-            pyarrow uproot pandas awkward h5py tqdm pyhepmc psutil pyedm4hep \
+            pyarrow uproot pandas awkward h5py tqdm pyyaml pyhepmc psutil pyedm4hep \
             polars huggingface_hub 2>/dev/null \
             && echo "Python packages installed." \
             || echo "WARNING: pip install failed. Postprocessing stages may fail."
