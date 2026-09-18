@@ -126,6 +126,7 @@ def _process_chunk_for_all(
     output_format: str = 'hdf5',
     row_group_size: int | None = None,
     preserve_unmatched_particle_id: bool = False,
+    preserve_particles_without_acts_match: bool = False,
 ) -> None:
     chunk_start_time = time.time()
     logger.info(f"Starting chunk processing for events {start_event}-{end_event}")
@@ -260,6 +261,7 @@ def _process_chunk_for_all(
                     min_particle_energy=min_particle_energy,
                     min_tracker_hits=min_tracker_hits,
                     min_calo_hits=min_calo_hits,
+                    preserve_particles_without_acts_match=preserve_particles_without_acts_match,
                 )
                 if not df_run.empty and "event_id" in df_run.columns:
                     # Update event_id in-place (no copy needed)
@@ -580,6 +582,7 @@ def convert_all(config: dict, chunk_index: int | None = None) -> None:
 
     row_group_size = config.get("row_group_size")  # None means PyArrow default (single row group)
     preserve_unmatched_particle_id = bool(config.get("preserve_unmatched_particle_id", False))
+    preserve_particles_without_acts_match = bool(config.get("preserve_particles_without_acts_match", False))
 
     processing_start_time = time.time()
     
@@ -620,6 +623,7 @@ def convert_all(config: dict, chunk_index: int | None = None) -> None:
             output_format=output_format,
             row_group_size=row_group_size,
             preserve_unmatched_particle_id=preserve_unmatched_particle_id,
+            preserve_particles_without_acts_match=preserve_particles_without_acts_match,
         ),
     )
 

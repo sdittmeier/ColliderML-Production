@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 
 import uproot
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -40,6 +42,23 @@ def one_parquet(directory: Path) -> Path:
     return files[0]
 
 
+def validate_particle_features(path: Path) -> None:
+    required = {"perigee_d0", "perigee_z0", "vertex_primary"}
+    schema = pq.read_schema(path)
+    missing = required - set(schema.names)
+    if missing:
+        raise ValueError(f"Converted particles lack ACTS fields: {sorted(missing)}")
+    table = pq.read_table(path, columns=["particle_id", *sorted(required)])
+    counts = pc.list_value_length(table["particle_id"]).to_pylist()
+    for name in sorted(required):
+        values = table[name]
+        if pc.list_value_length(values).to_pylist() != counts:
+            raise ValueError(f"Converted particle field {name} is not aligned with particle_id")
+        flat = pc.list_flatten(values)
+        if len(flat) == flat.null_count:
+            raise ValueError(f"Converted particle field {name} has no non-null values")
+
+
 def run_command(*parts: str) -> None:
     print("Running:", " ".join(parts), flush=True)
     subprocess.run(parts, check=True, cwd=REPO)
@@ -49,8 +68,11 @@ def run(args: argparse.Namespace) -> dict:
     if args.events < 1:
         raise ValueError("--events must be positive")
     output = args.output.resolve()
-    if output.exists():
+    resume_export = getattr(args, "resume_export", False)
+    if output.exists() and not resume_export:
         raise ValueError(f"Output already exists: {output}; choose a new directory")
+    if resume_export and (not output.is_dir() or (output / "complete.json").exists()):
+        raise ValueError("--resume-export requires an incomplete existing output directory")
     if not PAIRED_CONFIG.is_file() or not args.digi_config.is_file():
         raise ValueError("Paired ACTS config and geometric digitization config must exist")
     with args.digi_config.open() as stream:
@@ -73,39 +95,54 @@ def run(args: argparse.Namespace) -> dict:
     if not (args.odd_install / "lib/libOpenDataDetector.so").is_file():
         raise ValueError(f"ODD installation not found at {args.odd_install}")
 
-    output.mkdir(parents=True)
+    if not resume_export:
+        output.mkdir(parents=True)
     reports = {}
     for sample, campaign in SAMPLES:
         sample_dir = output / sample
         acts_dir = sample_dir / "acts"
-        run_command(sys.executable, str(REPO / "scripts/simulation/digi_and_reco.py"),
-                    "--config", str(PAIRED_CONFIG), "--events", str(args.events),
-                    "--threads", "1", "--digi-config", str(args.digi_config),
-                    "--input-file", str(inputs[sample]), "--output", str(acts_dir))
-
         conversion_input = output / "_conversion_input" / sample / "runs" / "0"
-        conversion_input.mkdir(parents=True)
-        (conversion_input / "edm4hep.root").symlink_to(inputs[sample])
-        (conversion_input / "measurements.root").symlink_to(acts_dir / "measurements.root")
         conversion_output = output / "_conversion_results"
-        config = {
-            "campaign": campaign, "dataset": "ttbar", "version": "v1",
-            "common": {"output_base_dir": str(conversion_output)},
-            "input_base_dir": str(conversion_input.parents[1]),
-            "h5_output_dir": str(conversion_output),
-            "objects": ["particles", "tracker_hits"], "output_format": "parquet",
-            "preserve_unmatched_particle_id": True,
-            "run_size": args.events, "chunk_size": args.events, "max_chunks": 1,
-            "log_level": "INFO",
-        }
         config_path = output / f"_convert_{sample}.json"
-        config_path.write_text(json.dumps(config, indent=2) + "\n")
-        run_command(sys.executable, str(REPO / "scripts/postprocessing/convert_all.py"),
-                    "--config", str(config_path), "--chunk-index", "0")
+        if resume_export:
+            config = json.loads(config_path.read_text())
+            if (config["run_size"] != args.events or config["chunk_size"] != args.events
+                    or config["campaign"] != campaign
+                    or (conversion_input / "edm4hep.root").resolve() != inputs[sample]
+                    or (conversion_input / "measurements.root").resolve() != acts_dir / "measurements.root"):
+                raise ValueError(f"{sample}: existing conversion inputs do not match this run")
+            for path in (acts_dir / "measurements.root", acts_dir / "simhits.root",
+                         acts_dir / "csv"):
+                if not path.exists():
+                    raise ValueError(f"{sample}: missing ACTS output {path}")
+        else:
+            run_command(sys.executable, str(REPO / "scripts/simulation/digi_and_reco.py"),
+                        "--config", str(PAIRED_CONFIG), "--events", str(args.events),
+                        "--threads", "1", "--digi-config", str(args.digi_config),
+                        "--input-file", str(inputs[sample]), "--output", str(acts_dir))
+            conversion_input.mkdir(parents=True)
+            (conversion_input / "edm4hep.root").symlink_to(inputs[sample])
+            (conversion_input / "measurements.root").symlink_to(acts_dir / "measurements.root")
+            (conversion_input / "particles.root").symlink_to(acts_dir / "particles.root")
+            config = {
+                "campaign": campaign, "dataset": "ttbar", "version": "v1",
+                "common": {"output_base_dir": str(conversion_output)},
+                "input_base_dir": str(conversion_input.parents[1]),
+                "h5_output_dir": str(conversion_output),
+                "objects": ["particles", "tracker_hits"], "output_format": "parquet",
+                "preserve_unmatched_particle_id": True,
+                "preserve_particles_without_acts_match": True,
+                "run_size": args.events, "chunk_size": args.events, "max_chunks": 1,
+                "log_level": "INFO",
+            }
+            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            run_command(sys.executable, str(REPO / "scripts/postprocessing/convert_all.py"),
+                        "--config", str(config_path), "--chunk-index", "0")
 
         parquet_root = conversion_output / campaign / "ttbar/v1/parquet"
         converted_hits = one_parquet(parquet_root / "reco/tracker_hits")
         particles = one_parquet(parquet_root / "truth/particles")
+        validate_particle_features(particles)
         run_command(sys.executable, str(REPO / "scripts/postprocessing/export_paired_clusters.py"),
                     "--campaign", campaign, "--dataset", "ttbar", "--version", "v1",
                     "--run", "0", "--acts-revision", acts_revision, "--odd-revision", odd_revision,
@@ -131,6 +168,8 @@ def main() -> None:
     parser.add_argument("--input-pu200", type=Path, default=Path("/data/pu200/edm4hep.root"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--events", type=int, default=1)
+    parser.add_argument("--resume-export", action="store_true",
+                        help="Reuse ACTS and converted outputs from an incomplete run")
     parser.add_argument("--digi-config", type=Path, default=DIGI_CONFIG)
     parser.add_argument("--acts-source", type=Path, default=Path("/opt/acts-arrow-src"))
     parser.add_argument("--odd-source", type=Path, default=Path("/cache/odd-v4"))

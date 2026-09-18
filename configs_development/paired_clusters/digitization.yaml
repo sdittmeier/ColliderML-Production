@@ -6,5 +6,6 @@ reco: false
 spacepoints: false
 output_measurements_root: true
 output_simhits_root: true
+output_particles_root: true
 output_cells_csv: true
 digi_config: scripts/simulation/odd-full-geo-digi-config.json

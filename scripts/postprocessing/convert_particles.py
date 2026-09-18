@@ -42,6 +42,7 @@ def process_event_for_particles(
     min_particle_energy: float | None = None,
     min_tracker_hits: int | None = None,
     min_calo_hits: int | None = None,
+    preserve_particles_without_acts_match: bool = False,
 ) -> pd.DataFrame:
     """
     Process particle data for a single event.
@@ -98,7 +99,7 @@ def process_event_for_particles(
                         particles_df,
                         local_digi[right_cols],
                         on=merge_cols,
-                        how="inner",
+                        how="left" if preserve_particles_without_acts_match else "inner",
                     )
                     # Drop duplicates
                     particles_df = particles_df.drop_duplicates(subset="particle_id")
@@ -210,6 +211,7 @@ def build_particles_df_with_parents_and_vertex(
     min_particle_energy: float | None = None,
     min_tracker_hits: int | None = None,
     min_calo_hits: int | None = None,
+    preserve_particles_without_acts_match: bool = False,
 ) -> pd.DataFrame:
     """
     Build a per-run particles dataframe using preloaded batch collections, with:
@@ -247,6 +249,7 @@ def build_particles_df_with_parents_and_vertex(
             min_particle_energy=min_particle_energy,
             min_tracker_hits=min_tracker_hits,
             min_calo_hits=min_calo_hits,
+            preserve_particles_without_acts_match=preserve_particles_without_acts_match,
         )
         if not ev_df.empty:
             frames.append(ev_df)

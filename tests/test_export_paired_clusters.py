@@ -207,8 +207,28 @@ class PairedClusterExportTest(unittest.TestCase):
         hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
         self.assertEqual([hit["particle_ids"] for hit in hits], [[4, 5], [5]])
         self.assertEqual([hit["particle_id"] for hit in hits], [None, 5])
+        self.assertEqual([hit["particle_ids_complete"] for hit in hits], [True, True])
         self.assertEqual(report["multi_particle_measurements"], 1)
         self.assertEqual(report["null_particle_labels"], 1)
+
+        with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits[1:]):
+            report = exporter.export(self.args)
+        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        self.assertEqual([hit["particle_ids"] for hit in hits], [[5], [5]])
+        self.assertEqual([hit["particle_id"] for hit in hits], [None, 5])
+        self.assertEqual([hit["particle_ids_complete"] for hit in hits], [False, True])
+        self.assertEqual([hit["unresolved_simhit_ids"] for hit in hits], [[0], []])
+        self.assertEqual(report["unresolved_simhit_links"], 1)
+        self.assertEqual(report["incomplete_truth_measurements"], 1)
+
+        self.write_converted(labels=(None, 4))
+        with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits):
+            report = exporter.export(self.args)
+        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        self.assertEqual(hits[1]["converted_particle_id"], 4)
+        self.assertEqual(hits[1]["particle_id"], 5)
+        self.assertEqual(report["converted_label_disagreements"], 1)
+        self.assertEqual(report["converted_label_disagreement_examples"][0]["measurement_id"], 1)
 
     def test_barcode_fallback_resolves_missing_coordinate(self) -> None:
         rows = [
@@ -218,8 +238,9 @@ class PairedClusterExportTest(unittest.TestCase):
         for row in rows:
             row.update(barcode_vertex_primary=0, barcode_vertex_secondary=0,
                        barcode_generation=0, barcode_sub_particle=0)
-        mapping, fallbacks = exporter.simhit_particle_map(0, rows, [(1, 2, 3, 42)], {0, 1})
+        mapping, unresolved, fallbacks = exporter.simhit_particle_map(0, rows, [(1, 2, 3, 42)], {0, 1})
         self.assertEqual(mapping, {0: 42, 1: 42})
+        self.assertEqual(unresolved, set())
         self.assertEqual(fallbacks, 1)
 
     def test_rejects_conflicting_barcode_truth(self) -> None:
@@ -233,12 +254,12 @@ class PairedClusterExportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting EDM4hep particles"):
             exporter.simhit_particle_map(0, rows, [(1, 2, 3, 42), (4, 5, 6, 43)], {0, 1})
 
-    def test_rejects_unresolved_simhit(self) -> None:
+    def test_marks_unresolved_simhit(self) -> None:
         row = {"tx": 1, "ty": 2, "tz": 3, "barcode_particle": 7,
                "barcode_vertex_primary": 0, "barcode_vertex_secondary": 0,
                "barcode_generation": 0, "barcode_sub_particle": 0}
-        with self.assertRaisesRegex(ValueError, "no unambiguous EDM4hep particle"):
-            exporter.simhit_particle_map(0, [row], [], {0})
+        mapping, unresolved, fallbacks = exporter.simhit_particle_map(0, [row], [], {0})
+        self.assertEqual((mapping, unresolved, fallbacks), ({}, {0}, 0))
 
 
 if __name__ == "__main__":

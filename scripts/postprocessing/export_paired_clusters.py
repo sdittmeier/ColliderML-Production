@@ -37,7 +37,10 @@ HIT_SCHEMA = pa.schema(KEY_SCHEMA + [
     pa.field("local0", pa.float64()),
     pa.field("local1", pa.float64()),
     pa.field("particle_id", pa.uint64()),
+    pa.field("converted_particle_id", pa.uint64()),
     pa.field("particle_ids", pa.list_(pa.uint64())),
+    pa.field("particle_ids_complete", pa.bool_()),
+    pa.field("unresolved_simhit_ids", pa.list_(pa.uint64())),
     pa.field("simhit_ids", pa.list_(pa.uint64())),
 ])
 CELL_SCHEMA = pa.schema(KEY_SCHEMA + [
@@ -129,7 +132,7 @@ def edm_tracker_hits(path: Path, event: int) -> list[tuple]:
 
 
 def simhit_particle_map(event: int, simhits: list[dict], edm_hits: list[tuple],
-                        requested: set[int]) -> tuple[dict[int, int], int]:
+                        requested: set[int]) -> tuple[dict[int, int], set[int], int]:
     def position(values):
         return tuple(float(np.float32(value)) for value in values)
 
@@ -156,6 +159,7 @@ def simhit_particle_map(event: int, simhits: list[dict], edm_hits: list[tuple],
             raise ValueError(f"Event {event}: ACTS barcode maps to conflicting EDM4hep particles")
 
     mapping = {}
+    unresolved = set()
     fallback_count = 0
     for index in requested:
         row = simhits[index]
@@ -170,9 +174,10 @@ def simhit_particle_map(event: int, simhits: list[dict], edm_hits: list[tuple],
             particle_id = barcode_particle
             fallback_count += 1
         else:
-            raise ValueError(f"Event {event}: SimHit {index} has no unambiguous EDM4hep particle")
+            unresolved.add(index)
+            continue
         mapping[index] = particle_id
-    return mapping, fallback_count
+    return mapping, unresolved, fallback_count
 
 
 def converted_events(path: Path, required: set[str]) -> dict[int, dict]:
@@ -260,6 +265,10 @@ def export(args: argparse.Namespace) -> dict:
     particle_count = 0
     multi_particle_measurements = 0
     simhit_truth_fallbacks = 0
+    unresolved_simhit_links = 0
+    incomplete_truth_measurements = 0
+    converted_label_disagreements = 0
+    disagreement_examples = []
     seen_events = set()
     for path in measurement_paths:
         match = EVENT_RE.fullmatch(path.name)
@@ -289,9 +298,10 @@ def export(args: argparse.Namespace) -> dict:
                 raise ValueError(f"Event {event}: orphan SimHit link {measurement_id}")
             simhit_ids[measurement_id].append(int(link["hit_id"]))
         truth_map = None
+        unresolved = set()
         if simhits_by_event is not None:
             requested = {simhit_id for ids in simhit_ids.values() for simhit_id in ids}
-            truth_map, fallbacks = simhit_particle_map(
+            truth_map, unresolved, fallbacks = simhit_particle_map(
                 event, simhits_by_event.get(event, []),
                 edm_tracker_hits(args.edm4hep, event) if requested else [], requested)
             simhit_truth_fallbacks += fallbacks
@@ -337,19 +347,32 @@ def export(args: argparse.Namespace) -> dict:
                                                  particles[event])
             for hit, label in zip(event_hits, labels):
                 hit["particle_id"] = label
+                hit["converted_particle_id"] = label
             particle_count += count
         if truth_map is not None:
             known_particles = set(particles[event]["particle_id"])
             for hit in event_hits:
-                particle_ids = list(dict.fromkeys(truth_map[index] for index in hit["simhit_ids"]))
+                missing = list(dict.fromkeys(index for index in hit["simhit_ids"] if index in unresolved))
+                particle_ids = list(dict.fromkeys(truth_map[index] for index in hit["simhit_ids"]
+                                                 if index in truth_map))
                 if not set(particle_ids).issubset(known_particles):
                     raise ValueError(f"Event {event}: SimHit truth references an absent particle")
                 prior_label = hit.get("particle_id")
-                if prior_label is not None and prior_label not in particle_ids:
-                    raise ValueError(f"Event {event}: converted label disagrees with SimHit truth")
+                if prior_label is not None and not missing and prior_label not in particle_ids:
+                    converted_label_disagreements += 1
+                    if len(disagreement_examples) < 10:
+                        disagreement_examples.append({
+                            "local_event": event, "measurement_id": hit["measurement_id"],
+                            "converted_particle_id": prior_label, "particle_ids": particle_ids,
+                        })
                 hit["particle_ids"] = particle_ids
-                hit["particle_id"] = particle_ids[0] if len(particle_ids) == 1 else None
+                complete = bool(hit["simhit_ids"]) and not missing
+                hit["particle_ids_complete"] = complete
+                hit["unresolved_simhit_ids"] = missing
+                hit["particle_id"] = particle_ids[0] if complete and len(particle_ids) == 1 else None
                 multi_particle_measurements += len(particle_ids) > 1
+                unresolved_simhit_links += len(missing)
+                incomplete_truth_measurements += not complete
         null_labels += sum(hit.get("particle_id") is None for hit in event_hits)
         hits.extend(event_hits)
 
@@ -363,6 +386,17 @@ def export(args: argparse.Namespace) -> dict:
     if not hits or not cells:
         raise ValueError("Digitization produced no hits or no cells")
 
+    particle_feature_coverage = None
+    if particles is not None:
+        particle_feature_coverage = {}
+        for name in ("perigee_d0", "perigee_z0", "vertex_primary"):
+            values = [value for row in particles.values() for value in row.get(name, [])]
+            particle_feature_coverage[name] = {
+                "present": all(name in row for row in particles.values()),
+                "nonnull": sum(value is not None for value in values),
+                "null": sum(value is None for value in values),
+            }
+
     report = {
         "campaign": args.campaign, "dataset": args.dataset, "version": args.version,
         "run": args.run, "events": len(seen_events), "local_events": sorted(seen_events),
@@ -370,9 +404,14 @@ def export(args: argparse.Namespace) -> dict:
         "cells": len(cells), "simhit_links": sum(len(hit["simhit_ids"]) for hit in hits),
         "multi_contributor_measurements": sum(len(hit["simhit_ids"]) > 1 for hit in hits),
         "particles": particle_count if particles is not None else None,
+        "particle_feature_coverage": particle_feature_coverage,
         "null_particle_labels": null_labels if particles is not None else None,
         "multi_particle_measurements": multi_particle_measurements if simhits_root_path else None,
         "simhit_truth_barcode_fallbacks": simhit_truth_fallbacks if simhits_root_path else None,
+        "unresolved_simhit_links": unresolved_simhit_links if simhits_root_path else None,
+        "incomplete_truth_measurements": incomplete_truth_measurements if simhits_root_path else None,
+        "converted_label_disagreements": converted_label_disagreements if simhits_root_path else None,
+        "converted_label_disagreement_examples": disagreement_examples if simhits_root_path else None,
         "revisions": {"colliderml_production": repo_revision(), "acts": args.acts_revision,
                       "odd": args.odd_revision},
         "source_sha256": {str(path.relative_to(Path(__file__).resolve().parents[2])): sha256(path)
