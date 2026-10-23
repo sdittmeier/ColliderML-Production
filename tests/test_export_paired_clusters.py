@@ -58,6 +58,7 @@ class PairedClusterExportTest(unittest.TestCase):
             measurements_root=self.base / "measurements.root",
             edm4hep=self.base / "edm4hep.root", digi_config=self.base / "digi.json",
             output=self.base / "export",
+            pixel_quantization="none",
         )
         self.args.edm4hep.write_bytes(b"test input")
         self.args.digi_config.write_text(json.dumps({"entries": [{"volume": 16}]}))
@@ -109,6 +110,63 @@ class PairedClusterExportTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "orphan cell"):
             exporter.export(self.args)
         self.assertFalse(self.args.output.exists())
+
+    def test_adds_pixel_codes_without_changing_native_features(self) -> None:
+        self.args.digi_config = MODULE_PATH.parents[2] / "scripts/simulation/odd-full-geo-digi-config.json"
+        strip_geometry = (23 << 56) | (2 << 36) | (3 << 8)
+        self.measurements[1]["geometry_id"] = strip_geometry
+        self.cells[2]["geometry_id"] = strip_geometry
+        self.cells[0]["value"] = .01
+        self.cells[1]["value"] = .12
+        self.write_inputs()
+        roots = exporter.root_measurements(self.args.measurements_root)
+        roots[0][1]["volume_id"] = 23
+        self.write_converted(labels=(4, None))
+        # Converted geometry must match the same pixel/strip event, too.
+        converted = pq.read_table(self.args.converted_hits).to_pydict()
+        converted["volume_id"] = [[16, 23]]
+        pq.write_table(pa.table(converted), self.args.converted_hits)
+        reference_hits = None
+        for scheme in ("none", "p99.9", "p99.5", "p99"):
+            self.args.pixel_quantization = scheme
+            self.args.output = self.base / scheme
+            with patch.object(exporter, "root_measurements", return_value=roots):
+                report = exporter.export(self.args)
+            table = pq.read_table(self.args.output / "cells.parquet")
+            cells = table.to_pylist()
+            self.assertEqual(table.schema.field("pixel_code").type, pa.uint8())
+            for output, source in zip(cells, self.cells):
+                for name in source:
+                    self.assertEqual(output[name], source[name])
+            self.assertIsNone(cells[2]["pixel_code"])
+            if scheme == "none":
+                self.assertTrue(all(cell["pixel_code"] is None for cell in cells))
+            else:
+                expected = exporter.PixelQuantizer(scheme).codes([.01, .12]).tolist()
+                self.assertEqual([cell["pixel_code"] for cell in cells[:2]], expected)
+                self.assertEqual(sum(report["cell_quantization"]["pixel_code_counts"].values()), 2)
+            encoding = json.loads(table.schema.metadata[exporter.METADATA_KEY])
+            self.assertEqual(encoding, report["cell_quantization"])
+            self.assertEqual(encoding["scheme"], scheme)
+            self.assertEqual(encoding["pixel_cells"], 2)
+            self.assertEqual(encoding["unchanged_nonpixel_cells"], 1)
+            hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+            if reference_hits is None:
+                reference_hits = hits
+            self.assertEqual(hits, reference_hits)
+            self.assertEqual((self.args.output / "particles.parquet").read_bytes(),
+                             self.args.particles.read_bytes())
+
+    def test_default_codes_and_config_gate_before_output(self) -> None:
+        del self.args.pixel_quantization
+        with self.assertRaisesRegex(ValueError, "calibrated geometric"):
+            exporter.export(self.args)
+        self.assertFalse(self.args.output.exists())
+        self.args.digi_config = MODULE_PATH.parents[2] / "scripts/simulation/odd-full-geo-digi-config.json"
+        report = exporter.export(self.args)
+        self.assertEqual(report["cell_quantization"]["scheme"], "p99.9")
+        self.assertEqual(pq.read_table(self.args.output / "cells.parquet")["pixel_code"].to_pylist(),
+                         [15, 15, 15])
 
     def test_rejects_different_cluster_size(self) -> None:
         self.cells.pop()

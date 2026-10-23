@@ -13,6 +13,14 @@ import uproot
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+try:
+    from scripts.postprocessing.utils.pixel_quantization import (
+        DEFAULT_SCHEME, PixelQuantizer, add_quantization_argument)
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from utils.pixel_quantization import DEFAULT_SCHEME, PixelQuantizer, add_quantization_argument
+
 
 REPO = Path(__file__).resolve().parents[2]
 PAIRED_CONFIG = REPO / "configs_development/paired_clusters/digitization.yaml"
@@ -75,6 +83,8 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("--resume-export requires an incomplete existing output directory")
     if not PAIRED_CONFIG.is_file() or not args.digi_config.is_file():
         raise ValueError("Paired ACTS config and geometric digitization config must exist")
+    pixel_quantization = getattr(args, "pixel_quantization", DEFAULT_SCHEME)
+    PixelQuantizer(pixel_quantization).validate_digi_config(args.digi_config)
     with args.digi_config.open() as stream:
         digi = json.load(stream)
     if not digi.get("entries"):
@@ -150,14 +160,16 @@ def run(args: argparse.Namespace) -> dict:
                     "--measurements-root", str(acts_dir / "measurements.root"),
                     "--simhits-root", str(acts_dir / "simhits.root"),
                     "--csv-dir", str(acts_dir / "csv"), "--converted-hits", str(converted_hits),
-                    "--particles", str(particles), "--output", str(sample_dir))
+                    "--particles", str(particles), "--output", str(sample_dir),
+                    "--pixel-quantization", pixel_quantization)
         report = json.loads((sample_dir / "report.json").read_text())
         if report["events"] != args.events or report["local_events"] != list(range(args.events)):
             raise ValueError(f"{sample}: exported events {report['local_events']}, "
                              f"expected {list(range(args.events))}")
         reports[sample] = report
 
-    summary = {"events_per_sample": args.events, "samples": reports}
+    summary = {"events_per_sample": args.events, "pixel_quantization": pixel_quantization,
+               "samples": reports}
     (output / "complete.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
@@ -174,6 +186,7 @@ def main() -> None:
     parser.add_argument("--acts-source", type=Path, default=Path("/opt/acts-arrow-src"))
     parser.add_argument("--odd-source", type=Path, default=Path("/cache/odd-v4"))
     parser.add_argument("--odd-install", type=Path, default=Path("/cache/odd-v4-install"))
+    add_quantization_argument(parser)
     print(json.dumps(run(parser.parse_args()), indent=2))
 
 

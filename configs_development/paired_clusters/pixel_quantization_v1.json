@@ -1,0 +1,36 @@
+{
+  "version": "odd-pixel-linear-v1",
+  "method": "linear_positive_codes",
+  "pixel_volumes": [16, 17, 18],
+  "activation_min": 0.01,
+  "input_units": "ACTS length units (mm), geometric path-length signal proxy",
+  "code_min": 1,
+  "code_max": 15,
+  "boundary_ties": "upper_bin",
+  "calibration": {
+    "sample": "full_pileup.ttbar.v1",
+    "run": 0,
+    "local_events": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+    "pixel_cells": 13285319,
+    "quantile_method": "linear",
+    "edm4hep_sha256": "7656dca207dfc96bb37c67ac524a6966d1a3ad10ebaaa4a9d3c0d493a874996f",
+    "digi_config_sha256": "61ebc9fde798b9dcffcbda3b07ae9bce9352a4f00a2c1d4354dae6441b886a8d",
+    "acts_revision": "7cba36b173dd73a14342cc65043a43179a4b1dbd",
+    "odd_revision": "b0992c148305224899a16d21fcd56406408bd393",
+    "source": "notebooks/validation/paired_vs_published.ipynb: linear threshold scan, calibration pu200 events 0-24, held-out events 25-49"
+  },
+  "schemes": {
+    "p99.9": {
+      "calibration_percentile": 99.9,
+      "boundaries": [0.02110552895900035, 0.032211057918000705, 0.04331658687700105, 0.05442211583600141, 0.06552764479500175, 0.0766331737540021, 0.08773870271300245, 0.0988442316720028, 0.10994976063100316, 0.12105528959000351, 0.13216081854900386, 0.1432663475080042, 0.15437187646700457, 0.16547740542600492]
+    },
+    "p99.5": {
+      "calibration_percentile": 99.5,
+      "boundaries": [0.01940929436785714, 0.028818588735714287, 0.038227883103571426, 0.04763717747142857, 0.05704647183928572, 0.06645576620714286, 0.07586506057499999, 0.08527435494285714, 0.09468364931071428, 0.10409294367857143, 0.11350223804642856, 0.1229115324142857, 0.13232082678214285, 0.14173012115]
+    },
+    "p99": {
+      "calibration_percentile": 99.0,
+      "boundaries": [0.019057082750000003, 0.028114165500000003, 0.037171248250000004, 0.046228331000000004, 0.055285413750000005, 0.0643424965, 0.07339957925, 0.082456662, 0.09151374475, 0.1005708275, 0.10962791025, 0.118684993, 0.12774207575000002, 0.13679915850000002]
+    }
+  }
+}

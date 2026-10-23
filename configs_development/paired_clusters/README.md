@@ -15,6 +15,9 @@ disagreements with resolved SimHit truth are counted in `report.json`, not
 silently substituted for it.
 
 There is no cell-level particle label or track reconstruction.
+Every cell retains its native activation in `value`. By default, pixel cells
+also receive a **P99.9 quantized `pixel_code`**, with frozen calibration, while
+strip codes are null. See [Pixel quantization](#pixel-quantization) below.
 This run enables both `simhits.root` and `particles.root`. Existing paired
 outputs without `particles.root` cannot acquire ACTS perigee/vertex fields
 through `--resume-export`; use a new output directory for a fresh ACTS run,
@@ -85,7 +88,8 @@ git -c safe.directory=/cache/odd-v4 -C /cache/odd-v4 rev-parse HEAD
 python3 -c 'import acts, pyedm4hep, pandas, pyarrow, uproot, yaml; print("Runtime imports OK")'
 cd /workspace
 python3 -m unittest tests.test_paired_nullable_particle_id \
-  tests.test_export_paired_clusters tests.test_run_paired_samples
+  tests.test_export_paired_clusters tests.test_run_paired_samples \
+  tests.test_production_pixel_quantization
 python3 /workspace/scripts/postprocessing/run_paired_samples.py \
   --output /output/paired-samples-features-n1
 ```
@@ -106,6 +110,8 @@ python3 /workspace/scripts/postprocessing/run_paired_samples.py \
 
 The resume command checks the existing input links, event count, ACTS files,
 and conversion files. It does not rerun ACTS or the production converter.
+It uses the requested quantization option (default P99.9), even if the
+original attempt used a different option; the final reports record it.
 It cannot add perigee/vertex fields to an older run without `particles.root`.
 `complete.json` is written only after both exports pass. Unresolved SimHits
 are reported and leave their hit's truth incomplete; they do not stop export.
@@ -178,3 +184,116 @@ The particle table comes from EDM4hep, enriched with ACTS-derived
 `perigee_d0`, `perigee_z0`, and `vertex_primary` from `particles.root`.
 Unmatched EDM particles are retained with null enrichment fields, and the
 report gives per-field coverage.
+
+## Pixel quantization
+
+Quantization is an optional feature calculation at export time, not a change
+to ACTS digitization or reconstruction. All new cell files have two columns:
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `value` | float64 | Original ACTS activation, unchanged for every cell |
+| `pixel_code` | nullable uint8 | Positive code 1-15 for pixels; null for all other volumes or when disabled |
+
+Pixel volumes are **16, 17 and 18 only**. Short strips (23-25), long strips
+(28-30), and other volumes are not quantized. A null code means "not encoded",
+not an active zero-valued channel. Retaining native `value` is useful for
+validation, recalibration and the future strip study. No redundant native
+copy is added to each row. The code range could fit four bits, but the Parquet
+column deliberately uses the standard nullable **uint8** type.
+
+Choose a preset with `--pixel-quantization`; **p99.9 is the default**:
+
+```bash
+# Default P99.9; creates both pu0 and pu200, each with native values and codes.
+python3 /workspace/scripts/postprocessing/run_paired_samples.py \
+  --events 50 --output /output/paired-samples-p99_9-n50
+
+# Other fixed presets (use a new output directory for each run).
+python3 /workspace/scripts/postprocessing/run_paired_samples.py \
+  --events 50 --pixel-quantization p99.5 --output /output/paired-samples-p99_5-n50
+python3 /workspace/scripts/postprocessing/run_paired_samples.py \
+  --events 50 --pixel-quantization p99 --output /output/paired-samples-p99-n50
+
+# Disable the extra encoding; value is still native and pixel_code is all null.
+python3 /workspace/scripts/postprocessing/run_paired_samples.py \
+  --events 50 --pixel-quantization none --output /output/paired-samples-native-n50
+```
+
+These are alternative full-run commands, not a requirement to rerun ACTS for
+each preset. The standalone `export_paired_clusters.py` accepts the same
+option and can use existing ACTS CSV/ROOT and converted-particle outputs.
+For an **incomplete** pipeline run, `--resume-export` also reuses these outputs.
+Existing completed exports are never automatically upgraded or changed.
+
+The authoritative definitions are in
+[`pixel_quantization_v1.json`](pixel_quantization_v1.json), version
+`odd-pixel-linear-v1`. They contain all 14 fixed boundaries per preset and the
+calibration provenance. Do not change these boundaries under the same version;
+a later calibration should have a new version and file.
+
+| Preset | Code-15 edge (native activation) | Nominal bin width |
+| --- | --- | --- |
+| `p99.9` | 0.16547740542600492 | 0.011105528959000351 |
+| `p99.5` | 0.14173012115 | 0.009409294367857143 |
+| `p99` | 0.13679915850000002 | 0.00905708275 |
+
+The calibration used pooled pixels from **ttbar pu200 run 0, events 0-24**.
+The same boundaries are used for every event, pu0 and pu200. Names refer to
+that original calibration population: **no percentile is fitted to a new
+event, file or physics sample**. These are path-length-based codes, not
+calibrated ATLAS ToT. Portability to other samples still needs validation.
+
+Encoding is exactly the notebook's linear scan: 14 equal-width bins start at
+activation 0.01, and code 15 starts at the selected edge. A value equal to a
+boundary goes into the upper bin. Values above the last boundary stay at 15;
+every retained pixel gets at least 1. Nonfinite/nonpositive values, or pixel
+values below 0.01 when encoding is enabled, cause an error, not suppression.
+There is no extra noise, threshold, random rounding, or charge decoding.
+
+Reports distinguish all cells assigned 15 from **genuine clipping** beyond
+the end of its nominal-width bin (`code15_edge + bin_width`). All cell counts,
+addresses, cluster membership, hit truth and native hit positions are unchanged;
+positions are **not** recomputed from codes. The existing validation notebook
+can continue using `value` as native activation.
+
+`report.json` contains `cell_quantization` with the scheme, preset version and
+checksum, exact boundaries, calibration inputs, pixel/nonpixel counts, code
+histogram, and clipping counts. The same object is embedded in the **cell
+Parquet schema metadata** as `colliderml.cell_quantization` so the encoding
+travels with the file. `complete.json` records the selected scheme as well.
+Quantized presets require the exact geometric digitization configuration used
+in calibration; a different config fails before ACTS. Use `none` to disable
+codes when studying a different setup rather than applying an unvalidated mapping.
+
+For an additional bounded-memory encoding check after the run, inside Docker:
+
+```bash
+cd /workspace
+python3 - <<'PY'
+import json
+from pathlib import Path
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+from scripts.postprocessing.utils.pixel_quantization import METADATA_KEY, PixelQuantizer
+
+root = Path('/output/paired-samples-p99_9-n50')
+for sample in ('pu0', 'pu200'):
+    folder = root / sample
+    report = json.loads((folder / 'report.json').read_text())
+    source = pq.ParquetFile(folder / 'cells.parquet')
+    encoding = json.loads(source.schema_arrow.metadata[METADATA_KEY])
+    assert encoding == report['cell_quantization']
+    assert source.schema_arrow.field('pixel_code').type == pa.uint8()
+    quantizer = PixelQuantizer(encoding['scheme'])
+    for batch in source.iter_batches(columns=['geometry_id', 'value', 'pixel_code']):
+        expected = quantizer.encode(batch.column('geometry_id').to_numpy(),
+                                    batch.column('value').to_numpy())
+        codes = batch.column('pixel_code')
+        assert np.array_equal(codes.is_valid().to_numpy(), expected != 0)
+        assert np.array_equal(codes.fill_null(0).to_numpy(), expected)
+    assert quantizer.report() == encoding
+    print(sample, encoding['scheme'], 'pixel cells', encoding['pixel_cells'], 'OK')
+PY
+```

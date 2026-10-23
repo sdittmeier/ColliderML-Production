@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export ACTS measurements, cells, and optional single-particle labels."""
+"""Export paired measurements, native cells, optional pixel codes, and particle truth."""
 
 from __future__ import annotations
 
@@ -18,6 +18,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 import uproot
+
+try:
+    from scripts.postprocessing.utils.pixel_quantization import (
+        DEFAULT_SCHEME, METADATA_KEY, PRESETS_PATH, PixelQuantizer, add_quantization_argument)
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from utils.pixel_quantization import (
+        DEFAULT_SCHEME, METADATA_KEY, PRESETS_PATH, PixelQuantizer, add_quantization_argument)
 
 
 KEY_FIELDS = ["campaign", "dataset", "version", "run", "local_event", "measurement_id"]
@@ -48,6 +57,7 @@ CELL_SCHEMA = pa.schema(KEY_SCHEMA + [
     pa.field("channel0", pa.int32()),
     pa.field("channel1", pa.int32()),
     pa.field("value", pa.float64()),
+    pa.field("pixel_code", pa.uint8()),
 ])
 CSV_FIELDS = {
     "measurements": {"measurement_id", "geometry_id", "global_x", "global_y", "global_z", "local0", "local1"},
@@ -235,6 +245,8 @@ def export(args: argparse.Namespace) -> dict:
         raise ValueError("run must be nonnegative")
     if not args.edm4hep.is_file() or not args.digi_config.is_file():
         raise ValueError("EDM4hep input and digitization config must exist")
+    quantizer = PixelQuantizer(getattr(args, "pixel_quantization", DEFAULT_SCHEME))
+    quantizer.validate_digi_config(args.digi_config)
     with args.digi_config.open() as stream:
         digi = json.load(stream)
     configured_volumes = {int(entry["volume"]) for entry in digi["entries"]}
@@ -308,7 +320,10 @@ def export(args: argparse.Namespace) -> dict:
 
         key_base = dict(campaign=args.campaign, dataset=args.dataset, version=args.version,
                         run=args.run, local_event=event)
-        for row in event_cells:
+        cell_codes = quantizer.encode(
+            [int(row["geometry_id"]) for row in event_cells],
+            [float(row["value"]) for row in event_cells])
+        for row, code in zip(event_cells, cell_codes):
             measurement_id = int(row["measurement_id"])
             if measurement_id not in by_id:
                 raise ValueError(f"Event {event}: orphan cell {measurement_id}")
@@ -317,7 +332,8 @@ def export(args: argparse.Namespace) -> dict:
                 raise ValueError(f"Event {event}: cell geometry differs from measurement {measurement_id}")
             cells.append({**key_base, "measurement_id": measurement_id,
                           "geometry_id": geometry_id, "channel0": int(row["channel0"]),
-                          "channel1": int(row["channel1"]), "value": float(row["value"])})
+                          "channel1": int(row["channel1"]), "value": float(row["value"]),
+                          "pixel_code": int(code) if code else None})
             cell_counts[measurement_id] += 1
 
         event_hits = []
@@ -402,6 +418,7 @@ def export(args: argparse.Namespace) -> dict:
         "run": args.run, "events": len(seen_events), "local_events": sorted(seen_events),
         "measurements": len(hits),
         "cells": len(cells), "simhit_links": sum(len(hit["simhit_ids"]) for hit in hits),
+        "cell_quantization": quantizer.report(),
         "multi_contributor_measurements": sum(len(hit["simhit_ids"]) > 1 for hit in hits),
         "particles": particle_count if particles is not None else None,
         "particle_feature_coverage": particle_feature_coverage,
@@ -421,6 +438,8 @@ def export(args: argparse.Namespace) -> dict:
                                        Path(__file__).resolve().parent / "convert_particles.py",
                                        Path(__file__).resolve().parent / "convert_digihits.py",
                                        Path(__file__).resolve().parent / "utils/parquet_utils.py",
+                                       Path(__file__).resolve().parent / "utils/pixel_quantization.py",
+                                       PRESETS_PATH,
                                        Path(__file__).resolve().parents[1] / "simulation/digi_and_reco.py",
                                        Path(__file__).resolve().parents[2] /
                                        "configs_development/paired_clusters/digitization.yaml")},
@@ -431,7 +450,9 @@ def export(args: argparse.Namespace) -> dict:
     }
     args.output.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(hits, schema=HIT_SCHEMA), args.output / "hits.parquet")
-    pq.write_table(pa.Table.from_pylist(cells, schema=CELL_SCHEMA), args.output / "cells.parquet")
+    cell_schema = CELL_SCHEMA.with_metadata({
+        METADATA_KEY: json.dumps(report["cell_quantization"], sort_keys=True).encode()})
+    pq.write_table(pa.Table.from_pylist(cells, schema=cell_schema), args.output / "cells.parquet")
     if particles_path:
         shutil.copyfile(particles_path, args.output / "particles.parquet")
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -448,6 +469,7 @@ def main() -> None:
     parser.add_argument("--converted-hits", type=Path)
     parser.add_argument("--particles", type=Path)
     parser.add_argument("--simhits-root", type=Path)
+    add_quantization_argument(parser)
     print(json.dumps(export(parser.parse_args()), indent=2))
 
 

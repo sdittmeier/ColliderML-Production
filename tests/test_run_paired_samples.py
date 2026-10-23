@@ -80,8 +80,12 @@ class PairedPipelineTest(unittest.TestCase):
             result = pipeline.run(self.args)
 
         self.assertEqual(result["events_per_sample"], 2)
+        self.assertEqual(result["pixel_quantization"], "p99.9")
         self.assertEqual(len(commands), 6)
         self.assertEqual(sum("--simhits-root" in command for command in commands), 2)
+        for command in commands:
+            if command[1].endswith("export_paired_clusters.py"):
+                self.assertEqual(command[command.index("--pixel-quantization") + 1], "p99.9")
         for sample in ("pu0", "pu200"):
             config_path = self.args.output / f"_convert_{sample}.json"
             config = json.loads(config_path.read_text())
@@ -94,6 +98,7 @@ class PairedPipelineTest(unittest.TestCase):
 
     def test_resume_reuses_digitization_and_conversion(self) -> None:
         self.args.events = 2
+        self.args.pixel_quantization = "p99.5"
         self.args.resume_export = True
         self.args.output.mkdir()
         for sample, campaign in pipeline.SAMPLES:
@@ -123,7 +128,26 @@ class PairedPipelineTest(unittest.TestCase):
             pipeline.run(self.args)
         self.assertEqual(len(commands), 2)
         self.assertTrue(all(command[1].endswith("export_paired_clusters.py") for command in commands))
+        self.assertTrue(all(command[command.index("--pixel-quantization") + 1] == "p99.5"
+                            for command in commands))
         self.assertTrue((self.args.output / "complete.json").exists())
+
+    def test_invalid_quantization_fails_before_running(self) -> None:
+        self.args.pixel_quantization = "unknown"
+        with patch.object(pipeline, "run_command") as command:
+            with self.assertRaisesRegex(ValueError, "Unknown pixel"):
+                pipeline.run(self.args)
+        command.assert_not_called()
+        self.assertFalse(self.args.output.exists())
+
+    def test_quantized_config_gate_precedes_simulation(self) -> None:
+        self.args.digi_config = self.base / "other-digi.json"
+        self.args.digi_config.write_text('{"entries": [{"volume": 16}]}')
+        with patch.object(pipeline, "run_command") as command:
+            with self.assertRaisesRegex(ValueError, "calibrated geometric"):
+                pipeline.run(self.args)
+        command.assert_not_called()
+        self.assertFalse(self.args.output.exists())
 
     def test_particle_feature_gate(self) -> None:
         path = self.base / "particles.parquet"
