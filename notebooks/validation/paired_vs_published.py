@@ -2449,6 +2449,163 @@ def plot_residual_resolution_fits(study, fits, samples=("pu200",)):
         plt.show()
 
 
+@dataclass
+class StoredPixelCodeValidation:
+    summary: pd.DataFrame
+    code_counts: pd.DataFrame
+    source_checksums: dict
+
+
+def _paired_parquet_batches(reference, encoded, columns, batch_size):
+    """Align rows across files even if row-group/batch boundaries differ."""
+    readers = [iter(file.iter_batches(batch_size=batch_size, columns=columns))
+               for file in (reference, encoded)]
+    batches = [next(reader, None) for reader in readers]
+    offsets = [0, 0]
+    while all(batch is not None for batch in batches):
+        length = min(batch.num_rows - offset for batch, offset in zip(batches, offsets))
+        yield tuple(batch.slice(offset, length) for batch, offset in zip(batches, offsets))
+        for index in range(2):
+            offsets[index] += length
+            if offsets[index] == batches[index].num_rows:
+                batches[index] = next(readers[index], None)
+                offsets[index] = 0
+    if any(batch is not None for batch in batches):
+        raise ValueError("Native and encoded cell row counts differ")
+
+
+def validate_stored_pixel_codes(encoded_root, native_root, expected_scheme="p99.9",
+                                batch_size=131072, progress=print):
+    """Read-only, full-campaign code checks using frozen bins, not a new calibration."""
+    encoded_root, native_root = Path(encoded_root), Path(native_root)
+    if encoded_root.resolve() == native_root.resolve():
+        raise ValueError("Use separate encoded and native reference directories")
+    if not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    preset_path = (Path(__file__).resolve().parents[2] /
+                   "configs_development/paired_clusters/pixel_quantization_v1.json")
+    preset_bytes = preset_path.read_bytes()
+    preset = json.loads(preset_bytes)
+    if expected_scheme not in preset["schemes"]:
+        raise ValueError("Choose a frozen positive-code preset: p99.9, p99.5 or p99")
+    boundaries = np.asarray(preset["schemes"][expected_scheme]["boundaries"])
+    clip_edge = boundaries[-1] + (boundaries[-1] - preset["activation_min"]) / 14
+    manifests = [json.loads((root / "complete.json").read_text())
+                 for root in (native_root, encoded_root)]
+    if manifests[0]["events_per_sample"] != manifests[1]["events_per_sample"]:
+        raise ValueError("Native and encoded campaign event counts differ")
+    if manifests[1].get("pixel_quantization") != expected_scheme:
+        raise ValueError("Encoded complete.json has the wrong quantization scheme")
+    before = {**quantization_source_checksums(native_root),
+              **quantization_source_checksums(encoded_root)}
+    rows, histogram_rows = [], []
+    for sample in PILEUP_COLORS:
+        if progress is not None:
+            progress(f"Validating {sample}: stored {expected_scheme}, all events, bounded-memory batches")
+        old_report = json.loads((native_root / sample / "report.json").read_text())
+        report = json.loads((encoded_root / sample / "report.json").read_text())
+        for name in ("events", "local_events", "measurements", "cells", "particles"):
+            if report[name] != old_report[name]:
+                raise ValueError(f"{sample}: native and encoded {name} differ")
+        if report["events"] != manifests[1]["events_per_sample"]:
+            raise ValueError(f"{sample}: report and campaign event counts differ")
+        if manifests[1]["samples"][sample] != report:
+            raise ValueError(f"{sample}: complete.json and report.json differ")
+        for kind in ("hits", "particles"):
+            old_path = native_root / sample / f"{kind}.parquet"
+            new_path = encoded_root / sample / f"{kind}.parquet"
+            if before[str(old_path)] != before[str(new_path)]:
+                raise ValueError(f"{sample}: {kind} file changed from the native export")
+        old = pq.ParquetFile(native_root / sample / "cells.parquet")
+        new = pq.ParquetFile(encoded_root / sample / "cells.parquet")
+        if old.metadata.num_rows != new.metadata.num_rows or new.metadata.num_rows != report["cells"]:
+            raise ValueError(f"{sample}: cell row counts disagree")
+        encoding = json.loads((new.schema_arrow.metadata or {}).get(b"colliderml.cell_quantization", b"{}"))
+        if encoding != report.get("cell_quantization"):
+            raise ValueError(f"{sample}: cell metadata and report encoding disagree")
+        if (not encoding.get("enabled") or encoding.get("scheme") != expected_scheme
+                or encoding.get("preset_version") != preset["version"]
+                or encoding.get("preset_sha256") != hashlib.sha256(preset_bytes).hexdigest()
+                or encoding.get("boundaries") != boundaries.tolist()
+                or encoding.get("pixel_volumes") != preset["pixel_volumes"]
+                or encoding.get("activation_min") != preset["activation_min"]
+                or encoding.get("calibration") != preset["calibration"]
+                or encoding.get("boundary_ties") != "upper_bin"
+                or encoding.get("code_min") != 1 or encoding.get("code_max") != 15
+                or not encoding.get("native_values_preserved")):
+            raise ValueError(f"{sample}: encoding does not match the frozen preset")
+        if "pixel_code" not in new.schema_arrow.names or new.schema_arrow.field("pixel_code").type != pa.uint8():
+            raise ValueError(f"{sample}: pixel_code must be a nullable uint8 column")
+        columns = [name for name in old.schema_arrow.names if name != "pixel_code"]
+        if set(new.schema_arrow.names) != set(columns) | {"pixel_code"}:
+            raise ValueError(f"{sample}: unexpected native cell schema change")
+        # Compare all original columns, including the full measurement key, without a join.
+        for original, regenerated in _paired_parquet_batches(old, new, columns, batch_size):
+            if not original.equals(regenerated):
+                raise ValueError(f"{sample}: native cell keys, geometry, channels or values changed")
+        histogram = np.zeros(16, dtype=np.int64)
+        pixels_total = nonpixels_total = clipped = cells_total = 0
+        seen_events = set()
+        for batch in new.iter_batches(batch_size=batch_size,
+                columns=["local_event", "geometry_id", "value", "pixel_code"]):
+            values = batch.column("value").to_numpy()
+            geometry = batch.column("geometry_id").to_numpy()
+            codes = batch.column("pixel_code")
+            pixels = np.isin((geometry >> 56) & 0xff, preset["pixel_volumes"])
+            if not np.array_equal(codes.is_valid().to_numpy(zero_copy_only=False), pixels):
+                raise ValueError(f"{sample}: missing pixel codes or non-null strip/other codes")
+            if not np.isfinite(values).all() or np.any(values <= 0) or np.any(values[pixels] < preset["activation_min"]):
+                raise ValueError(f"{sample}: invalid native activation")
+            expected = np.zeros(batch.num_rows, dtype=np.uint8)
+            expected[pixels] = 1 + np.searchsorted(boundaries, values[pixels], side="right")
+            stored = codes.fill_null(0).to_numpy()
+            if not np.array_equal(stored, expected):
+                raise ValueError(f"{sample}: stored pixel codes disagree with frozen boundaries")
+            histogram += np.bincount(stored[pixels], minlength=16)
+            pixels_total += int(pixels.sum())
+            nonpixels_total += int((~pixels).sum())
+            clipped += int(np.count_nonzero(values[pixels] >= clip_edge))
+            cells_total += batch.num_rows
+            seen_events.update(np.unique(batch.column("local_event").to_numpy()).tolist())
+        expected_counts = {str(code): int(histogram[code]) for code in range(1, 16)}
+        if pixels_total == 0:
+            raise ValueError(f"{sample}: no pixel cells available for code validation")
+        if (encoding.get("pixel_code_counts") != expected_counts
+                or encoding.get("pixel_cells") != pixels_total
+                or encoding.get("unchanged_nonpixel_cells") != nonpixels_total
+                or encoding.get("code15_cells") != int(histogram[15])
+                or encoding.get("genuinely_clipped_cells") != clipped
+                or sorted(seen_events) != report["local_events"]):
+            raise ValueError(f"{sample}: stored code/event counts disagree with the report")
+        rows.append(dict(sample=sample, scheme=expected_scheme, events=len(seen_events),
+                         cells=cells_total, pixel_cells=pixels_total, null_nonpixel_codes=nonpixels_total,
+                         code15_cells=int(histogram[15]), code15_fraction=histogram[15] / pixels_total,
+                         genuinely_clipped_cells=clipped, native_cells_unchanged=True,
+                         hits_particles_byte_identical=True, all_codes_match=True))
+        histogram_rows.extend(dict(sample=sample, code=code, cells=int(histogram[code]),
+                                   fraction=histogram[code] / pixels_total) for code in range(1, 16))
+    after = {**quantization_source_checksums(native_root),
+             **quantization_source_checksums(encoded_root)}
+    if before != after:
+        raise ValueError("Source Parquet checksums changed during validation")
+    return StoredPixelCodeValidation(pd.DataFrame(rows), pd.DataFrame(histogram_rows), after)
+
+
+def plot_stored_pixel_codes(validation):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    for sample, color in PILEUP_COLORS.items():
+        rows = validation.code_counts.query("sample == @sample")
+        for ax in axes:
+            ax.plot(rows.code, rows.fraction, marker="o" if sample == "pu0" else "s",
+                    color=color, label=sample, linewidth=2)
+    for ax, scale in zip(axes, ("linear", "log")):
+        ax.set(xlabel="Stored pixel_code", ylabel="Pixel-cell fraction", yscale=scale,
+               title=f"Stored codes: {scale} frequency scale", xticks=range(1, 16))
+        ax.grid(alpha=.15)
+        ax.legend()
+    plt.show()
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] != "--atlas-pixels":
         raise SystemExit("Usage: paired_vs_published.py --atlas-pixels graph.pyg")

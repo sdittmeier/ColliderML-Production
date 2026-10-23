@@ -319,6 +319,25 @@ existing `paired-clusters` notebook environment, without upgrading NumPy or
 changing the ACTS runtime. On another existing notebook environment, install
 SciPy there before running the fit cells.
 
+## Stored Pixel-Code Validation
+
+After producing and copying `exports/paired-samples-p99_9-n50`, reload the notebook
+from disk and find **Validate stored pixel codes against the native export** at
+the end. Run only its two code cells, even in a fresh `paired-clusters` kernel.
+There is no need to rerun the previous calibration/ATLAS/resolution sections.
+
+`STORED_CODE_ROOT` selects the new export; `NATIVE_CODE_REFERENCE_ROOT` selects the
+original `paired-samples-features-n50`. `STORED_CODE_SCHEME` defaults to `p99.9`.
+This validation checks all events and both samples, not just `NEW_EVENT`.
+
+Bounded-memory batches check all original cell columns row for row, code bounds,
+exact frozen boundary/tie behavior, null strip/other codes, counts and metadata.
+Hit and particle files must be byte-identical to the reference. All twelve source
+Parquets are hashed before and after. It does not write or refit any dataset.
+The section displays per-sample checks, a full code histogram and shared-axis
+pu0/pu200 frequency overlays in both linear and logarithmic views. Files with
+different row-group sizes are compared with aligned row slices.
+
 For collaborator discussion, keep an information-preserving native cell product
 separate from optional quantized views. Do not overwrite raw activations,
 membership, native positions or truth links based solely on a core fit. Any
