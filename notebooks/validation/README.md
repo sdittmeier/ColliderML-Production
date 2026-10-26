@@ -2,10 +2,12 @@
 
 ## Higgs-portal pilot
 
-`higgs_portal_pilot.ipynb` validates the copied Higgs-portal output at
-`exports/higgs-portal-pilot-run1-n1/paired` by default. Change `PILOT_ROOT` and
-`EVENT` in its configuration cell for another pilot/event. No ACTS, Docker,
-PyTorch or additional input download is needed. Use the same regular plotting
+`higgs_portal_pilot.ipynb` now defaults to the published 100-event release at
+`/mnt/data2/data/collider_ml/homebrew/higgs_portal_v2_cells`.
+Change `PAIRED_ROOT` and `EVENT` in its configuration cell for another release/event;
+the original `exports/higgs-portal-pilot-run1-n1/paired` layout is also supported.
+No ACTS, Docker, ROOT inputs, PyTorch or additional input download is needed for
+the release validation. Use the same regular plotting
 environment described below (also providing IPython through `ipykernel`):
 
 ```bash
@@ -16,8 +18,23 @@ python -m jupyter lab notebooks/validation/higgs_portal_pilot.ipynb
 
 Pu0 is blue, pu200 green, with common bins and normalized overlays. These are
 **independent hard-scatter events**, not a controlled same-event pileup pair.
-The current pu0 source ROOT entry corresponds to original event 7; pu200 uses
-signal event 0. Identical local event IDs do not imply event matching.
+Identical local event IDs do not imply event matching. The provenance table maps
+pu200 ROOT-entry/local-event IDs to merged HepMC signal IDs; multithreaded Geant4
+can reorder ROOT entries.
+
+Restart the kernel and Run All to replace saved outputs from earlier pilot runs.
+`EVENT=0` drives detailed feature histograms and cluster galleries.
+`PREVIEW_EVENTS=(0, 24, 99)` adds spatial views and measurements linked to displaced
+generator-origin charged particles; there are no reconstructed tracks.
+`RUN_FULL_SHARD_SCAN=True` checks all 100 events in both settings by default.
+The scan reads each flat shard sequentially, retains one event plus input batches,
+and only accumulates count/coverage tables and flagged-hit rows. Expect several
+minutes; progress is printed every ten events. It validates full-key joins,
+geometry/channel uniqueness, all contributor references, all frozen pixel codes,
+null strip codes, and aggregate counts against the reports. It lists all hits with
+incomplete truth separately from complete-truth legacy-label disagreements, and
+plots per-event counts, truth rates, code-15 rates and perigee coverage. Disabling
+the full scan leaves only selected-event checks, not full-release validation.
 
 The notebook checks completion/simulation evidence, full-key cell-hit joins,
 particle contributors and scalar labels, ROOT-derived count reports, schemas,
@@ -51,7 +68,11 @@ The older boundary-correcting `writer-v1` reports under `validation/perigee_writ
 and `/tmp/colliderml-paired-40167/output/perigee-writer-smoke` are historical.
 See the patch README for current output paths and production validation results.
 
-The **Current stored truth-perigee validation** section tests the new files at
+The historical **Current stored truth-perigee validation** section is optional
+(`RUN_PERIGEE_REFERENCE=False` by default). Its reference covers only the original
+one-event pilot; it cannot validate numerical perigee accuracy in the 100-event
+release. It additionally requires the original baseline and ROOT files. When
+explicitly enabled with the original pilot configuration, it tests the files at
 `PAIRED_ROOT`, using the original-event reference under
 `PILOT_ROOT/validation/perigee_reference`. That reference is hash-checked against
 `BASELINE_PAIRED_ROOT`, which defaults to `PILOT_ROOT/paired.before-recovery-v2`.

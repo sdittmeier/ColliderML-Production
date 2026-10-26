@@ -149,7 +149,21 @@ def check_collections(tree):
         raise ValueError(f"EDM4hep input lacks required collections: {missing}")
 
 
-def validate_simulation(edm4hep, merged_hepmc, events):
+def boost_four_momentum(vector, beta):
+    """Lorentz boost [px, py, pz, E], in GeV; beta is dimensionless."""
+    vector, beta = np.asarray(vector, dtype=float), np.asarray(beta, dtype=float)
+    b2 = float(beta @ beta)
+    if not np.isfinite(vector).all() or not np.isfinite(beta).all() or b2 >= 1:
+        raise ValueError("Invalid decay boost")
+    if b2 == 0:
+        return vector.copy()
+    gamma = 1 / math.sqrt(1 - b2)
+    product = float(beta @ vector[:3])
+    return np.r_[vector[:3] + ((gamma - 1) * product / b2 + gamma * vector[3]) * beta,
+                 gamma * (vector[3] + product)]
+
+
+def validate_simulation(edm4hep, merged_hepmc, events, report_path=None):
     """Check source-event mapping and catastrophic displaced-decay failure modes."""
     import awkward as ak
     import pyhepmc
@@ -159,11 +173,13 @@ def validate_simulation(edm4hep, merged_hepmc, events):
             if event.event_number in reference:
                 raise ValueError("Duplicate merged event number")
             reference[event.event_number] = event
+            if len(reference) % 10 == 0:
+                print(f"Loaded validation reference {len(reference)}/{events} events", flush=True)
     if set(reference) != set(range(events)):
         raise ValueError("Merged HepMC event set differs from the requested logical events")
     endpoint_errors, checked_descendants, displaced = [], 0, 0
     adjusted_matches, maximum_adjustment = 0, 0.0
-    mapping = []
+    mapping, failures, boost_matches = [], [], []
     with uproot.open(edm4hep) as root:
         tree = root["events"]
         if tree.num_entries != events:
@@ -172,9 +188,19 @@ def validate_simulation(edm4hep, merged_hepmc, events):
         fields = ("PDG", "generatorStatus", "charge", "vertex.x", "vertex.y", "vertex.z",
                   "endpoint.x", "endpoint.y", "endpoint.z", "momentum.x", "momentum.y", "momentum.z")
         names = {field: branch(tree, "MCParticles." + field) for field in fields}
+        # Older synthetic fixtures need no decay fallback. Real files carry these
+        # PODIO relations and endpoint momenta; never infer indices from row order.
+        topology_fields = ("parents_begin", "parents_end", "mass",
+                           "momentumAtEndpoint.x", "momentumAtEndpoint.y", "momentumAtEndpoint.z")
+        try:
+            topology_names = {field: branch(tree, "MCParticles." + field) for field in topology_fields}
+            parent_name = branch(tree, "_MCParticles_parents.index")
+        except ValueError:
+            topology_names, parent_name = {}, None
+        names.update(topology_names)
         header = branch(tree, "EventHeader.eventNumber")
         for entry in range(events):
-            batch = tree.arrays([header, *names.values()], entry_start=entry, entry_stop=entry+1, library="ak")
+            batch = tree.arrays([header, *names.values(), *([parent_name] if parent_name else [])], entry_start=entry, entry_stop=entry+1, library="ak")
             event_numbers = np.asarray(ak.to_list(batch[header][0])).reshape(-1)
             if len(event_numbers) != 1:
                 raise ValueError("An EDM4hep entry must have exactly one EventHeader")
@@ -185,8 +211,16 @@ def validate_simulation(edm4hep, merged_hepmc, events):
             data = {field: ak.to_numpy(batch[name][0]) for field, name in names.items()}
             momentum = np.column_stack([data[f"momentum.{axis}"] for axis in "xyz"])
 
+            parent_indices = ak.to_numpy(batch[parent_name][0]) if parent_name else None
+            cache, in_progress = {}, set()
+            event_boost_matches = []
+
             def match(particle, allow_decay_adjustment=False):
                 nonlocal adjusted_matches, maximum_adjustment
+                if particle.id in cache:
+                    return cache[particle.id]
+                if particle.id in in_progress:
+                    raise ValueError("Cyclic decay ancestry")
                 expected = np.array([particle.momentum.px, particle.momentum.py, particle.momentum.pz])
                 mask = ((data["PDG"] == particle.pid) & (data["generatorStatus"] > 0)
                         & np.isclose(momentum, expected, rtol=2e-6, atol=2e-5).all(axis=1))
@@ -203,8 +237,76 @@ def validate_simulation(edm4hep, merged_hepmc, events):
                         indices = candidates
                         adjusted_matches += 1
                         maximum_adjustment = max(maximum_adjustment, float(distances[indices[0]] / scale))
+                if len(indices) == 0 and allow_decay_adjustment and parent_indices is not None:
+                    incoming = list(particle.production_vertex.particles_in)
+                    # A physical single-parent decay, not a shower/hadronization
+                    # vertex: identify the parent independently, then its child.
+                    if len(incoming) == 1 and incoming[0].momentum.m2() > 0:
+                        parent = incoming[0]
+                        in_progress.add(particle.id)
+                        try:
+                            parent_index = match(parent, allow_decay_adjustment=parent.pid != 36)
+                        finally:
+                            in_progress.remove(particle.id)
+                        # Confirm the matched parent's relation graph leads back to
+                        # the same strictly matched signal LLP, excluding pileup.
+                        expected_roots, todo, visited = set(), [parent], set()
+                        while todo:
+                            ancestor = todo.pop()
+                            if ancestor.id in visited:
+                                continue
+                            visited.add(ancestor.id)
+                            if ancestor.pid == 36 and ancestor.id in cache:
+                                expected_roots.add(cache[ancestor.id])
+                            elif ancestor.production_vertex is not None:
+                                todo.extend(ancestor.production_vertex.particles_in)
+                        actual_roots, todo = set(), [parent_index]
+                        while todo:
+                            ancestor = int(todo.pop())
+                            if ancestor in actual_roots:
+                                continue
+                            if not 0 <= ancestor < len(momentum):
+                                raise ValueError("Invalid EDM4hep parent reference")
+                            actual_roots.add(ancestor)
+                            todo.extend(parent_indices[data["parents_begin"][ancestor]:data["parents_end"][ancestor]])
+                        if not expected_roots.intersection(actual_roots):
+                            raise ValueError(f"Event {number}: decay parent lacks matching LLP ancestry")
+                        parent_momentum = np.array([data[f"momentumAtEndpoint.{a}"][parent_index] for a in "xyz"])
+                        mass = float(data["mass"][parent_index])
+                        energy = math.sqrt(float(parent_momentum @ parent_momentum) + mass * mass)
+                        if mass > 0 and energy > 0:
+                            four = np.r_[expected, particle.momentum.e]
+                            original_beta = np.array([parent.momentum.px, parent.momentum.py,
+                                                      parent.momentum.pz]) / parent.momentum.e
+                            predicted = boost_four_momentum(boost_four_momentum(four, -original_beta),
+                                                            parent_momentum / energy)[:3]
+                            scale = max(float(np.linalg.norm(predicted)), .02)
+                            candidates = []
+                            for candidate in np.flatnonzero((data["PDG"] == particle.pid)
+                                                           & (data["generatorStatus"] > 0)):
+                                parents = parent_indices[data["parents_begin"][candidate]:data["parents_end"][candidate]]
+                                if len(parents) != 1 or parents[0] != parent_index:
+                                    continue
+                                vertex_error = float(np.linalg.norm([
+                                    data[f"vertex.{a}"][candidate] - data[f"endpoint.{a}"][parent_index]
+                                    for a in "xyz"]))
+                                residual = float(np.linalg.norm(momentum[candidate] - predicted) / scale)
+                                if vertex_error <= 1e-4 and residual <= 1e-3:
+                                    candidates.append((int(candidate), residual, vertex_error))
+                            if len(candidates) == 1:
+                                candidate, residual, vertex_error = candidates[0]
+                                indices = np.array([candidate])
+                                event_boost_matches.append(dict(
+                                    hepmc_id=particle.id, pdg=particle.pid, mcparticle=candidate,
+                                    parent_hepmc_id=parent.id, parent_mcparticle=parent_index, parent_pdg=parent.pid,
+                                    original_relative_momentum_difference=float(np.linalg.norm(momentum[candidate] - expected) /
+                                                                              max(float(np.linalg.norm(expected)), .02)),
+                                    predicted_relative_momentum_residual=residual,
+                                    daughter_to_parent_endpoint_error_mm=vertex_error))
                 if len(indices) != 1:
-                    raise ValueError(f"Event {number}: no unique generator MCParticle match for PDG {particle.pid}")
+                    raise ValueError(f"Event {number}: no unique generator MCParticle match for PDG {particle.pid} "
+                                     f"(HepMC {particle.id}, candidates {len(indices)})")
+                cache[particle.id] = int(indices[0])
                 return int(indices[0])
 
             signal = reference[number]
@@ -231,8 +333,24 @@ def validate_simulation(edm4hep, merged_hepmc, events):
                         descendants[particle.id] = particle
                     if particle.end_vertex is not None:
                         todo.extend(particle.end_vertex.particles_out)
+            used = set()
             for particle in descendants.values():
-                index = match(particle, allow_decay_adjustment=True)
+                try:
+                    index = match(particle, allow_decay_adjustment=True)
+                    if index in used:
+                        raise ValueError(f"Event {number}: duplicate descendant match to MCParticle {index}")
+                    used.add(index)
+                except ValueError as error:
+                    expected = np.array([particle.momentum.px, particle.momentum.py, particle.momentum.pz])
+                    distances = np.linalg.norm(momentum - expected, axis=1)
+                    candidates = np.flatnonzero((data["PDG"] == particle.pid) & (data["generatorStatus"] > 0))
+                    nearest = candidates[np.argsort(distances[candidates])[:3]]
+                    failures.append(dict(event=number, root_entry=entry, hepmc_id=particle.id,
+                                         pdg=particle.pid, error=str(error),
+                                         nearest_original_momentum_candidates=[dict(
+                                             mcparticle=int(i), relative_difference=float(distances[i] /
+                                                 max(float(np.linalg.norm(expected)), .02))) for i in nearest]))
+                    continue
                 if data["charge"][index] == 0:
                     continue
                 checked_descendants += 1
@@ -242,9 +360,20 @@ def validate_simulation(edm4hep, merged_hepmc, events):
                     radius = math.hypot(data["vertex.x"][index], data["vertex.y"][index])
                     if not math.isfinite(radius) or radius < 1:
                         raise ValueError(f"Event {number}: displaced LLP descendant placed at collision point")
+            boost_matches.extend(dict(event=number, root_entry=entry, **row) for row in event_boost_matches)
+            if (entry + 1) % 10 == 0:
+                print(f"Validated {entry + 1}/{events} ROOT entries; "
+                      f"boost matches={len(boost_matches)}, unmatched descendants={len(failures)}", flush=True)
     if len(endpoint_errors) != 2 * events:
         raise ValueError("LLP endpoint coverage is incomplete")
-    return dict(events=events, root_to_hepmc=mapping, llps_checked=len(endpoint_errors),
+    report = dict(events=events, root_to_hepmc=mapping, llps_checked=len(endpoint_errors),
+                validation_algorithm="ancestry-decay-boost-v1",
+                decay_boost_matches=boost_matches, decay_boost_match_count=len(boost_matches),
+                maximum_decay_boost_relative_residual=max(
+                    (row["predicted_relative_momentum_residual"] for row in boost_matches), default=0.),
+                decay_boost_relative_residual_tolerance=1e-3,
+                decay_boost_vertex_tolerance_mm=1e-4,
+                descendant_matching_failures=failures, passed=not failures,
                 maximum_llp_endpoint_error_mm=max(endpoint_errors),
                 charged_descendants_checked=checked_descendants,
                 displaced_charged_descendants_checked=displaced,
@@ -253,6 +382,13 @@ def validate_simulation(edm4hep, merged_hepmc, events):
                 decay_momentum_matching_relative_tolerance=1e-3,
                 displacement_gate_exercised=displaced > 0,
                 interpretation="Pilot sanity gate, not a complete LLP physics validation")
+    if report_path is not None:
+        write_json(report_path, report)
+    if failures:
+        raise ValueError(f"Descendant matching failed for {len(failures)} particles across "
+                         f"{len({row['event'] for row in failures})} events; "
+                         f"first: {failures[0]['error']}; see simulation_validation.json")
+    return report
 
 
 def geant4_data_paths():
@@ -381,8 +517,12 @@ def run(args):
         recovery_changes = {"scripts/simulation/higgs_portal_pilot.py",
                             "scripts/simulation/ddsim_run.py",
                             "scripts/simulation/recover_duplicate_events.py"}
+        validation_changes = {"scripts/simulation/higgs_portal_pilot.py"}
         code_matches = (not changed_sources or
-                        (args.stage == "recover" and changed_sources <= recovery_changes))
+                        (args.stage == "recover" and changed_sources <= recovery_changes) or
+                        (args.stage == "validate" and changed_sources <= validation_changes) or
+                        (args.stage == "export" and changed_sources <= validation_changes
+                         and manifest.get("validation_source_checksums") == source_checksums))
         if (not manifest.get("prepared") or not code_matches
                 or manifest["run"] != args.run or manifest["events"] != args.events
                 or manifest["signal_start"] != args.signal_start
@@ -440,7 +580,8 @@ def run(args):
         elapsed = command([sys.executable, REPO / "scripts/simulation/ddsim_run.py", "--config",
                            output / "simulation.json", "--input-file", merged, "--output", simulation],
                           output / "simulation.log")
-        validation = validate_simulation(simulation / "edm4hep.root", merged, args.events)
+        validation = validate_simulation(simulation / "edm4hep.root", merged, args.events,
+                                         output / "simulation_validation.json")
         write_json(output / "simulation_validation.json", validation)
         if not validation["displacement_gate_exercised"]:
             print("WARNING: no charged descendant beyond 10 mm in this small sample; exercise that gate in the larger pilot.")
@@ -448,6 +589,30 @@ def run(args):
         manifest["timings_seconds"]["geant4"] = elapsed
         manifest["geant4_wall_seconds_per_event"] = elapsed / args.events
         manifest["simulation_threads"] = args.threads
+        write_json(manifest_path, manifest)
+    if args.stage == "validate":
+        # Revalidate existing bytes; never invoke generation, recovery or Geant4.
+        if (output / "paired").exists():
+            raise ValueError("Validation resume requires an output without paired products")
+        simulated = output / "simulation/pu200/edm4hep.root"
+        merged = output / "generation/merged_events.hepmc3"
+        config = json.loads((output / "simulation.json").read_text())
+        if config.get("events") != args.events or config.get("threads") != args.threads:
+            raise ValueError("Saved simulation events/threads differ from resume arguments")
+        if (checksum(merged) != manifest["merged_sha256"] or
+                checksum(output / "particle_llpfix.tbl") != manifest["particle_table_sha256"]):
+            raise ValueError("Prepared simulation inputs changed")
+        before = checksum(simulated)
+        if manifest.get("simulation_sha256", before) != before:
+            raise ValueError("Previously recorded simulation checksum differs")
+        validate_simulation(simulated, merged, args.events, output / "simulation_validation.json")
+        if checksum(simulated) != before:
+            raise ValueError("Simulation changed during validation")
+        manifest.update(simulation_validated=True, simulation_sha256=before,
+                        simulation_threads=config["threads"],
+                        validation_source_checksums=source_checksums,
+                        original_simulation_timing_report=str(simulated.parent / "timing_summary.txt"))
+        # source_checksums remains the immutable producer provenance.
         write_json(manifest_path, manifest)
     if args.stage in ("all", "export"):
         simulated = output / "simulation/pu200/edm4hep.root"
@@ -481,7 +646,7 @@ def main():
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--run", type=int, default=0)
     parser.add_argument("--signal-start", type=int, default=0)
-    parser.add_argument("--stage", choices=("all", "prepare", "simulate", "recover", "export"), default="all")
+    parser.add_argument("--stage", choices=("all", "prepare", "simulate", "recover", "validate", "export"), default="all")
     parser.add_argument("--seed-namespace", default="colliderml-higgs-portal-cells-pilot-2026-10")
     parser.add_argument("--registry", type=Path, default=Path("/cache/higgs-portal-pilot/pileup-seeds.json"))
     parser.add_argument("--signal", type=Path, default=Path("/data/higgs_portal/v2/signal/run0/events_signal.hepmc3"))

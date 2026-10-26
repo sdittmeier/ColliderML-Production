@@ -1,6 +1,7 @@
 """Read-only integrity checks and plots for the Higgs-portal paired pilot."""
 
 from dataclasses import dataclass
+from itertools import zip_longest
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import uproot
 
@@ -27,11 +30,53 @@ class Sample:
     analysis: object
 
 
+def sample_files(root, sample):
+    """Resolve the original paired layout or the published homebrew layout."""
+    root = Path(root)
+    if (root / sample / "report.json").is_file():
+        return ({kind: root / sample / f"{kind}.parquet" for kind in ("hits", "cells", "particles")},
+                root / sample / "report.json")
+    paths = {}
+    for kind in ("hits", "cells", "particles"):
+        name = f"higgs_portal_{sample}_{kind}"
+        files = sorted((root / name / "data" / name).glob("*.parquet"))
+        if len(files) != 1:
+            raise ValueError(f"Expected one {name} shard under {root}, found {len(files)}")
+        paths[kind] = files[0]
+    reports = sorted(root.glob(f"provenance/run-*/{sample}_report.json"))
+    if len(reports) != 1:
+        raise ValueError("Select a release with exactly one run provenance directory")
+    return paths, reports[0]
+
+
+def production_evidence(root):
+    root = Path(root)
+    if (root / "complete.json").is_file():
+        parent, complete = root.parent, root / "complete.json"
+    else:
+        files = sorted(root.glob("provenance/run-*/paired_complete.json"))
+        if len(files) != 1:
+            raise ValueError("Expected one paired completion report")
+        complete, parent = files[0], files[0].parent
+    pilot = json.loads((parent / "pilot.json").read_text())
+    simulation = json.loads((parent / "simulation_validation.json").read_text())
+    completion = json.loads(complete.read_text())
+    if not pilot.get("complete") or not pilot.get("simulation_validated") or simulation.get("passed") is False:
+        raise ValueError("Production is not complete and validated")
+    if simulation.get("descendant_matching_failures"):
+        raise ValueError("Simulation has unresolved descendant matching failures")
+    if pilot["events"] != completion["events_per_sample"] or pilot["events"] != simulation["events"]:
+        raise ValueError("Production event counts disagree")
+    if set(completion["samples"]) != {"pu0", "pu200"}:
+        raise ValueError("Production lacks a pileup setting")
+    return pilot, completion, simulation
+
+
 def file_hashes(paired_root):
     result = {}
     for sample in paired.PILEUP_COLORS:
-        for kind in ("hits", "cells", "particles"):
-            path = Path(paired_root) / sample / f"{kind}.parquet"
+        paths, _ = sample_files(paired_root, sample)
+        for kind, path in paths.items():
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
@@ -56,20 +101,34 @@ def particle_frame(row):
     return frame
 
 
-def load_samples(paired_root, event=0):
+def particle_batch_row(batch):
+    """Keep nested numeric columns in NumPy, avoiding millions of Python scalars."""
+    return {field.name: (batch.column(i)[0].as_py() if field.name == "event_id"
+                         else batch.column(i)[0].values.to_numpy(zero_copy_only=False))
+            for i, field in enumerate(batch.schema)}
+
+
+def particle_event(path, event):
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=1):
+        if int(batch.column("event_id")[0].as_py()) == event:
+            return particle_frame(particle_batch_row(batch))
+    raise ValueError(f"Particle event {event} not found in {path}")
+
+
+def load_samples(paired_root, event=0, include_cells=True):
     result = {}
     for name in paired.PILEUP_COLORS:
-        folder = Path(paired_root) / name
-        paths = {kind: folder / f"{kind}.parquet" for kind in ("hits", "cells", "particles")}
-        report = json.loads((folder / "report.json").read_text())
+        paths, report_path = sample_files(paired_root, name)
+        report = json.loads(report_path.read_text())
         for kind, expected in (("hits", "measurements"), ("cells", "cells"), ("particles", "events")):
             if pq.read_metadata(paths[kind]).num_rows != report[expected]:
                 raise ValueError(f"{name}: {kind} row count disagrees with report.json")
-        hits, cells = (paired._flat_event(paths[kind], event) for kind in ("hits", "cells"))
-        if hits.num_rows == 0 or cells.num_rows == 0:
+        hits = paired._flat_event(paths["hits"], event)
+        cells = paired._flat_event(paths["cells"], event) if include_cells else None
+        if hits.num_rows == 0 or (include_cells and cells.num_rows == 0):
             raise ValueError(f"{name}: event {event} not present or empty")
-        particles = particle_frame(paired._event_row(paths["particles"], event))
-        analysis = paired.build_cluster_analysis(hits, cells, name, event)
+        particles = particle_event(paths["particles"], event)
+        analysis = paired.build_cluster_analysis(hits, cells, name, event) if include_cells else None
         result[name] = Sample(name, event, paths, report, hits, cells, particles, analysis)
     return result
 
@@ -86,6 +145,8 @@ def integrity(samples):
         for field in ("campaign", "dataset", "version", "run"):
             if context.iloc[0][field] != data.report[field]:
                 raise ValueError(f"{name}: {field} differs from report")
+        if isinstance(data.cells, pa.Table):
+            validate_cell_links(data.hits, data.cells)
         known = set(data.particles.particle_id)
         lists = hits.particle_ids.tolist()
         if any(len(ids) != len(set(ids)) or not set(ids) <= known for ids in lists):
@@ -101,8 +162,9 @@ def integrity(samples):
         unresolved = sum(map(len, hits.unresolved_simhit_ids))
         incomplete = int((~hits.particle_ids_complete).sum())
         multi = sum(len(ids) > 1 for ids in lists)
-        disagreements = sum(pd.notna(label) and int(label) not in ids
-                            for label, ids in zip(hits.converted_particle_id, lists))
+        disagreements = sum(complete and pd.notna(label) and int(label) not in ids
+                            for complete, label, ids in
+                            zip(hits.particle_ids_complete, hits.converted_particle_id, lists))
         measured = dict(measurements=len(hits), cells=data.cells.num_rows,
                         particles=len(data.particles), simhit_links=sum(map(len, hits.simhit_ids)),
                         null_particle_labels=int(scalar.isna().sum()),
@@ -127,7 +189,8 @@ def quantization(samples):
         metadata = json.loads(pq.read_schema(data.paths["cells"]).metadata[b"colliderml.cell_quantization"])
         if metadata != encoded:
             raise ValueError(f"{name}: quantization metadata disagrees with report")
-        cells = data.analysis.cells
+        cells = data.cells.select(["geometry_id", "value", "pixel_code"]).to_pandas()
+        cells["volume_id"] = cells.geometry_id.to_numpy(dtype=np.uint64) >> 56
         pixels = cells.volume_id.isin(encoded["pixel_volumes"])
         codes = cells.loc[pixels, "pixel_code"].to_numpy(dtype=float)
         values = cells.loc[pixels, "value"].to_numpy()
@@ -142,9 +205,9 @@ def quantization(samples):
             if count15 != encoded["code15_cells"] or clipped != encoded["genuinely_clipped_cells"]:
                 raise ValueError(f"{name}: encoding counts differ from report")
         rows.append(dict(sample=name, scheme=encoded["scheme"], pixel_cells=len(codes),
-                         code15_cells=count15, code15_fraction=count15 / len(codes),
-                         genuinely_clipped_cells=clipped, clipped_fraction=clipped / len(codes),
-                         native_max=float(values.max()), checks="PASS"))
+                         code15_cells=count15, code15_fraction=count15 / len(codes) if len(codes) else np.nan,
+                         genuinely_clipped_cells=clipped, clipped_fraction=clipped / len(codes) if len(codes) else np.nan,
+                         native_max=float(values.max()) if len(values) else np.nan, checks="PASS"))
     return pd.DataFrame(rows).set_index("sample")
 
 
@@ -436,4 +499,172 @@ def plot_perigee_validation(comparisons, summary, value_label="Candidate"):
         axes[1, column].set_xlim(left=0)
         for ax in axes[:, column]:
             ax.legend(fontsize=8)
+    plt.show()
+
+
+def validate_cell_links(hits, cells):
+    """Full-key join without building the plot-oriented per-cell truth frame."""
+    keys = paired.MEASUREMENT_KEY
+    contexts = hits.select(keys[:-1]).to_pandas().drop_duplicates()
+    if len(contexts) == 1:
+        # Same full-key check, avoiding repeated string keys on a million cells.
+        # Only use numeric measurement IDs after proving every context field.
+        for field in keys[:-1]:
+            if not pc.all(pc.fill_null(pc.equal(cells[field], hits[field][0]), False)).as_py():
+                raise ValueError("Orphan cells: full event context differs from parent hits")
+        hit_index = pd.Index(hits["measurement_id"].to_numpy())
+        addresses = cells.select(["measurement_id", "channel0", "channel1"]).to_pandas()
+        cell_index = pd.Index(addresses.measurement_id)
+        address_keys = ["measurement_id", "channel0", "channel1"]
+    else:
+        hit_index = pd.MultiIndex.from_frame(hits.select(keys).to_pandas())
+        addresses = cells.select(keys + ["channel0", "channel1"]).to_pandas()
+        cell_index = pd.MultiIndex.from_frame(addresses[keys])
+        address_keys = keys + ["channel0", "channel1"]
+    if not hit_index.is_unique:
+        raise ValueError("Duplicate full measurement key")
+    parents = hit_index.get_indexer(cell_index)
+    if (parents < 0).any():
+        raise ValueError("Orphan cells: missing full-key parent hit")
+    if len(np.unique(parents)) != len(hits):
+        raise ValueError("Hits without cells")
+    if addresses.duplicated(address_keys).any():
+        raise ValueError("Duplicate channel address within a cluster")
+    if not np.array_equal(hits["geometry_id"].to_numpy()[parents], cells["geometry_id"].to_numpy()):
+        raise ValueError("Cell geometry differs from parent hit")
+    values = cells["value"].to_numpy()
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("Invalid cell activation")
+
+
+def iter_flat_events(path, batch_size=65536):
+    """Read each flat shard once, retaining at most one event plus one batch."""
+    current, pieces = None, []
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size):
+        table = pa.Table.from_batches([batch])
+        ids = table["local_event"].to_numpy()
+        if len(ids) == 0:
+            continue
+        if np.any(ids[1:] < ids[:-1]) or (current is not None and ids[0] < current):
+            raise ValueError("Flat shard must be ordered by local_event")
+        boundaries = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1, len(ids)]
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            event = int(ids[start])
+            if current is not None and event != current:
+                yield current, pa.concat_tables(pieces)
+                pieces = []
+            current = event
+            pieces.append(table.slice(int(start), int(stop - start)))
+    if current is not None:
+        yield current, pa.concat_tables(pieces)
+
+
+def perigee_coverage(particles, sample, event):
+    rows = []
+    for cohort in ("all", "generator_charged_with_hits", "charged_with_hits", "displaced_charged_with_hits"):
+        frame = particle_selection(particles, cohort)
+        for feature in ("perigee_d0", "perigee_z0"):
+            finite = np.isfinite(frame[feature].to_numpy())
+            rows.append(dict(sample=sample, event=event, cohort=cohort, feature=feature,
+                             particles=len(frame), finite=int(finite.sum()), nonfinite=int((~finite).sum())))
+    return rows
+
+
+def truth_review(sample, limit=None):
+    frame = sample.hits.to_pandas()
+    incomplete = ~frame.particle_ids_complete
+    disagreement = pd.Series([complete and pd.notna(label) and int(label) not in ids
+                              for complete, label, ids in zip(frame.particle_ids_complete,
+                                                             frame.converted_particle_id, frame.particle_ids)], index=frame.index)
+    mask = incomplete | disagreement
+    columns = paired.MEASUREMENT_KEY + ["particle_id", "converted_particle_id", "particle_ids",
+                                       "particle_ids_complete", "unresolved_simhit_ids", "simhit_ids"]
+    result = frame.loc[mask, columns].copy()
+    result["issue"] = np.where(incomplete[mask], "incomplete contributor truth", "legacy label disagreement")
+    result["sample"] = sample.name
+    return result if limit is None else result.head(limit)
+
+
+def scan_campaign(root, progress=True):
+    """All events, all cells; sequential scans, no collection of large event frames."""
+    counts, codes, coverage_rows, issues = [], [], [], []
+    for name in paired.PILEUP_COLORS:
+        paths, report_path = sample_files(root, name)
+        report = json.loads(report_path.read_text())
+        particle_rows = pq.ParquetFile(paths["particles"]).iter_batches(batch_size=1)
+        seen = []
+        for hit_event, cell_event, particle_batch in zip_longest(
+                iter_flat_events(paths["hits"]), iter_flat_events(paths["cells"]), particle_rows):
+            if hit_event is None or cell_event is None or particle_batch is None:
+                raise ValueError("Hit/cell/particle event sets differ")
+            row = particle_batch_row(particle_batch)
+            event = int(row["event_id"])
+            if hit_event[0] != event or cell_event[0] != event or event in seen:
+                raise ValueError("Hit/cell/particle event IDs differ or repeat")
+            seen.append(event)
+            sample = Sample(name, event, paths, report, hit_event[1], cell_event[1], particle_frame(row), None)
+            check = integrity({name: sample}).reset_index().iloc[0].to_dict()
+            check["llps"] = int((sample.particles.pdg_id.abs() == 36).sum())
+            counts.append(check)
+            codes.append(dict(event=event, **quantization({name: sample}).reset_index().iloc[0].to_dict()))
+            coverage_rows.extend(perigee_coverage(sample.particles, name, event))
+            issues.extend(truth_review(sample).to_dict("records"))
+            if progress and len(seen) % 10 == 0:
+                print(f"{name}: checked {len(seen)}/{report['events']} complete events", flush=True)
+            del sample, hit_event, cell_event, row, particle_batch
+        if seen != list(range(report["events"])):
+            raise ValueError("Shard does not contain exactly local events 0..N-1")
+        measured = pd.DataFrame([r for r in counts if r["sample"] == name])
+        for key in ("measurements", "cells", "particles", "simhit_links", "null_particle_labels",
+                    "multi_particle_measurements", "unresolved_simhit_links", "incomplete_truth_measurements",
+                    "converted_label_disagreements"):
+            if int(measured[key].sum()) != report[key]:
+                raise ValueError(f"{name}: all-event {key} differs from report")
+        code_rows = [r for r in codes if r["sample"] == name]
+        for field, expected in (("code15_cells", "code15_cells"), ("genuinely_clipped_cells", "genuinely_clipped_cells")):
+            if sum(r[field] for r in code_rows) != report["cell_quantization"][expected]:
+                raise ValueError(f"{name}: all-event quantization counts differ from report")
+    return dict(counts=pd.DataFrame(counts), codes=pd.DataFrame(codes),
+                perigees=pd.DataFrame(coverage_rows), issues=pd.DataFrame(issues))
+
+
+def plot_campaign(scan):
+    counts, codes, perigees = (scan[k] for k in ("counts", "codes", "perigees"))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    for name, color in paired.PILEUP_COLORS.items():
+        frame = counts[counts["sample"] == name]
+        code = codes[codes["sample"] == name]
+        for ax, column in zip(axes.flat[:3], ("measurements", "cells", "particles")):
+            ax.plot(frame.event, frame[column], color=color, marker=".", label=name)
+            ax.set(title=column, xlabel="Local event", ylabel="Count", yscale="log")
+        axes[1, 0].plot(frame.event, frame.incomplete_truth_measurements / frame.measurements,
+                        color=color, marker=".", label=name)
+        axes[1, 1].plot(code.event, code.code15_fraction, color=color, marker=".", label=name)
+        coverage = perigees[(perigees["sample"] == name) & (perigees.cohort == "generator_charged_with_hits")
+                           & (perigees.feature == "perigee_d0")]
+        axes[1, 2].plot(coverage.event, coverage.nonfinite / coverage.particles.replace(0, np.nan),
+                        color=color, marker=".", label=name)
+    for ax, title, ylabel in zip(axes[1], ("Incomplete hit truth", "Pixel code 15", "Generator charged-with-hits d0 coverage"),
+                                ("Fraction of hits", "Fraction of pixel cells", "Fraction non-finite")):
+        ax.set(title=title, xlabel="Local event", ylabel=ylabel)
+    for ax in axes.flat:
+        ax.legend()
+    plt.show()
+
+
+def plot_linked_hits(samples, limit=15000, seed=7):
+    """Display truth-labelled measurements; no reconstructed tracks are present."""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
+    for column, (name, sample) in enumerate(samples.items()):
+        selected = particle_selection(sample.particles, "generator_charged_with_hits")
+        selected = selected[selected.production_r > 10]
+        ids = set(selected.particle_id)
+        hits = sample.hits.to_pandas()
+        hits = hits[[bool(ids.intersection(p)) for p in hits.particle_ids]]
+        view = hits.sample(min(limit, len(hits)), random_state=seed)
+        color = paired.PILEUP_COLORS[name]
+        axes[0, column].scatter(view.global_x, view.global_y, s=3, color=color, alpha=.35)
+        axes[1, column].scatter(view.global_z, np.hypot(view.global_x, view.global_y), s=3, color=color, alpha=.35)
+        axes[0, column].set(title=f"{name}: hits linked to displaced generator particles", xlabel="x [mm]", ylabel="y [mm]")
+        axes[1, column].set(xlabel="z [mm]", ylabel="r [mm]")
     plt.show()

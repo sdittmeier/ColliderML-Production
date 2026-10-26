@@ -204,3 +204,46 @@ After success, copy the whole pilot directory from `/tmp` to a new directory
 under `exports/` to preserve its logs, provenance and generation/simulation inputs.
 Copying only `paired/` is sufficient for analysis but loses the pilot-level
 simulation evidence unless that is preserved separately.
+
+## Resume after a post-simulation validation failure
+
+If Geant4 completed successfully but descendant matching failed, retain the run
+and its ROOT file. The validator keeps the original strict LLP matching and the
+0.1% daughter-momentum allowance. A further fallback handles physical decay
+boosts: independently identify the parent, verify its relation graph reaches the
+same signal LLP, require a unique daughter with the correct PDG and parent link,
+and require its production vertex within `1e-4 mm` of that parent's simulated
+endpoint. Boost the original daughter through the original parent's rest frame
+into the frame defined by the parent's recorded momentum at decay. The predicted
+and stored daughter momenta must agree within the existing 0.1% convention
+(`max(|p|, 0.02 GeV)`). Neutral descendants remain included. No simulation values
+are modified. Unexplained and ambiguous matches still fail.
+
+The report records each boost-assisted match, its original discrepancy and its
+prediction residual. Descendant matching failures are collected across all
+events into `simulation_validation.json` before failing the validation gate.
+LLP endpoint and structural failures still stop immediately.
+
+For the existing 100-event run, from a host shell in the same tmux/Slurm session:
+
+```bash
+cd /home/atlas/dittmeier/git/cluster_extraction/ColliderML-Production
+
+bash scripts/cli/run_higgs_portal_pilot.sh \
+  --events 100 --threads 25 --run 3 --signal-start 0 \
+  --stage validate --output /output/higgs-portal-run3-n100 && \
+bash scripts/cli/run_higgs_portal_pilot.sh \
+  --events 100 --threads 25 --run 3 --signal-start 0 \
+  --stage export --output /output/higgs-portal-run3-n100
+```
+
+`validate` checks prepared-input checksums and saved event/thread settings, checks
+that the ROOT checksum is unchanged during validation, and records the successful
+validation and its source checksums. It permits an updated validator script while
+preserving the original producer source checksums; changes to other production
+sources are rejected. `export` accepts that recorded validator version and starts
+only after validation succeeds. Neither command generates pileup or reruns
+Geant4. No image rebuild is required. The `25` thread argument identifies the
+saved simulation settings; validation/export remain serial. Reading the full
+merged HepMC reference can take tens of minutes; progress is printed every ten
+events. Paired products are written under the existing run's `paired/` directory.

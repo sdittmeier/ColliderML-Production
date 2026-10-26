@@ -4,6 +4,7 @@ import importlib.util
 import ast
 import json
 import math
+import numpy as np
 import os
 from pathlib import Path
 import shutil
@@ -141,6 +142,82 @@ class HiggsPortalPilotTest(unittest.TestCase):
         self.edm(root, numbers=(0,), daughter_adjustment=.003)
         with self.assertRaisesRegex(ValueError, "no unique generator MCParticle"):
             pilot.validate_simulation(root, source, 1)
+
+    def decay_boost_fixture(self, wrong_parent=False, vertex_offset=0., corrupt_momentum=0., ambiguous=False):
+        source, root = self.root / "boost.hepmc3", self.root / "boost.root"
+        self.signal(source, numbers=(0,))
+        self.edm(root, numbers=(0,))
+        with uproot.open(root) as handle:
+            arrays = {name: ak.to_list(value) for name, value in handle["events"].arrays(library="ak", how=dict).items()}
+        prefix = "MCParticles/MCParticles."
+        endpoint = np.array([31., 0., 0.])
+        predicted = pilot.boost_four_momentum(
+            pilot.boost_four_momentum([1., .2, .3, 1.1], [-30 / math.hypot(30, 55), 0, 0]),
+            endpoint / math.sqrt(float(endpoint @ endpoint) + 55**2))
+        for axis, value in zip("xyz", predicted):
+            arrays[prefix + "momentum." + axis][0][2] = float(value) + (corrupt_momentum if axis == "x" else 0.)
+            arrays[prefix + "momentumAtEndpoint." + axis] = [[
+                float(endpoint["xyz".index(axis)]), -30. if axis == "x" else 0., 0., 0.]]
+        arrays[prefix + "vertex.x"][0][2] += vertex_offset
+        arrays[prefix + "parents_begin"] = [[0, 0, 0, 1]]
+        arrays[prefix + "parents_end"] = [[0, 0, 1, 2]]
+        arrays[prefix + "mass"] = [[55., 55., .13957, .13957]]
+        arrays["_MCParticles_parents/_MCParticles_parents.index"] = [[1 if wrong_parent else 0, 1]]
+        if ambiguous:
+            for name, values in arrays.items():
+                if name.startswith(prefix):
+                    values[0].append(values[0][2])
+        with uproot.recreate(root) as handle:
+            handle["events"] = {name: ak.Array(value) for name, value in arrays.items()}
+        return source, root
+
+    def test_decay_boost_fallback_uses_saved_parent_and_vertex(self):
+        source, root = self.decay_boost_fixture()
+        report = pilot.validate_simulation(root, source, 1)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["decay_boost_match_count"], 1)
+        row = report["decay_boost_matches"][0]
+        self.assertGreater(row["original_relative_momentum_difference"], .001)
+        self.assertLess(row["predicted_relative_momentum_residual"], 1e-12)
+
+    def test_decay_boost_rejects_wrong_parent_vertex_momentum_and_ambiguity(self):
+        for options in ({"wrong_parent": True}, {"vertex_offset": .001},
+                        {"corrupt_momentum": .01}, {"ambiguous": True}):
+            with self.subTest(options=options):
+                source, root = self.decay_boost_fixture(**options)
+                report_path = self.root / "failed.json"
+                with self.assertRaisesRegex(ValueError, "Descendant matching failed"):
+                    pilot.validate_simulation(root, source, 1, report_path)
+                report = json.loads(report_path.read_text())
+                self.assertFalse(report["passed"])
+                self.assertEqual(len(report["descendant_matching_failures"]), 1)
+
+    def test_neutral_descendants_are_still_validated(self):
+        source, root = self.decay_boost_fixture()
+        with self.hep.open(str(source)) as reader:
+            event = reader.read()
+        next(p for p in event.particles if p.pid == 211).pid = 22
+        with self.hep.open(str(source), "w") as writer:
+            writer.write(event)
+        with uproot.open(root) as handle:
+            arrays = {name: ak.to_list(value) for name, value in handle["events"].arrays(library="ak", how=dict).items()}
+        arrays["MCParticles/MCParticles.PDG"][0][2] = 22
+        arrays["MCParticles/MCParticles.charge"][0][2] = 0.
+        with uproot.recreate(root) as handle:
+            handle["events"] = {name: ak.Array(value) for name, value in arrays.items()}
+        report = pilot.validate_simulation(root, source, 1)
+        self.assertEqual(report["decay_boost_matches"][0]["pdg"], 22)
+        self.assertEqual(report["charged_descendants_checked"], 1)
+
+    def test_lorentz_boost_identity_inverse_and_invalid_beta(self):
+        vector = np.array([1., .2, -.3, 2.])
+        np.testing.assert_array_equal(pilot.boost_four_momentum(vector, [0, 0, 0]), vector)
+        boosted = pilot.boost_four_momentum(vector, [.2, -.1, .3])
+        np.testing.assert_allclose(pilot.boost_four_momentum(boosted, [-.2, .1, -.3]), vector)
+        self.assertAlmostEqual(boosted[3]**2 - boosted[:3] @ boosted[:3],
+                               vector[3]**2 - vector[:3] @ vector[:3])
+        with self.assertRaisesRegex(ValueError, "Invalid decay boost"):
+            pilot.boost_four_momentum(vector, [1, 0, 0])
 
     def test_recovery_preserves_original_and_records_old_code_provenance(self):
         from scripts.simulation import recover_duplicate_events
@@ -317,6 +394,21 @@ class HiggsPortalPilotTest(unittest.TestCase):
             simulated = pilot.run(args)
             self.assertTrue(simulated["simulation_validated"])
             self.assertEqual(simulated["simulation_threads"], 8)
+            original_sources = dict(simulated["source_checksums"])
+            old_manifest = json.loads((args.output / "pilot.json").read_text())
+            old_manifest["source_checksums"]["scripts/simulation/higgs_portal_pilot.py"] = "old-validator"
+            old_manifest.pop("simulation_validated")
+            (args.output / "pilot.json").write_text(json.dumps(old_manifest))
+            args.stage = "validate"
+            validated = pilot.run(args)
+            self.assertTrue(validated["simulation_validated"])
+            self.assertEqual(len(calls), 2)  # validation never invokes a physics command
+            self.assertEqual(validated["source_checksums"], old_manifest["source_checksums"])
+            self.assertEqual(validated["validation_source_checksums"], original_sources)
+            args.threads = 7
+            with self.assertRaisesRegex(ValueError, "events/threads"):
+                pilot.run(args)
+            args.threads = 8
             args.stage = "export"
             finished = pilot.run(args)
             self.assertTrue(finished["complete"])
