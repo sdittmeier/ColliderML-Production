@@ -171,6 +171,15 @@ def configure_physics(ddsim, config, logger):
     # Set physics list if specified
     if hasattr(config, 'physics_list'):
         ddsim.physics.list = config.physics_list
+
+    # Preserve preassigned displaced decays instead of promoting their daughters
+    # to particles originating at the hard-scatter vertex.
+    if getattr(config, 'alternative_decay_statuses', None) is not None:
+        ddsim.physics.alternativeDecayStatuses = set(config.alternative_decay_statuses)
+        logger.info(f"Alternative decay statuses: {ddsim.physics.alternativeDecayStatuses}")
+    if getattr(config, 'extra_reject_pdgs', None) is not None:
+        ddsim.physics.rejectPDGs = set(ddsim.physics.rejectPDGs) | set(config.extra_reject_pdgs)
+        logger.info(f"Rejected generator PDGs: {ddsim.physics.rejectPDGs}")
     
     # Set truth particle handler
     if hasattr(config, 'truthParticleHandler'):
@@ -249,6 +258,22 @@ def configure_verbosity_and_ui(ddsim, config, logger):
     
     return ddsim
 
+def single_thread_edm4hep_output(simulation):
+    """Avoid the shared writer's duplicate event callbacks in sequential DDG4."""
+    import DDG4
+    kernel = DDG4.Kernel().worker()
+    output = DDG4.EventAction(kernel, "Geant4Output2EDM4hep/EDM4hepOutput", False)
+    output.Control = True
+    output.Output = simulation.outputFile
+    output.enableUI()
+    output.RunHeader = simulation.meta.addParametersToRunHeader(simulation)
+    parameters = simulation.meta.parseEventParameters()
+    output.EventParametersString, output.EventParametersInt, output.EventParametersFloat = parameters
+    output.RunNumberOffset = max(0, simulation.meta.runNumberOffset)
+    output.EventNumberOffset = max(0, simulation.meta.eventNumberOffset)
+    kernel.eventAction().add(output)
+
+
 def run_ddsim(input_path, output_path, config, logger=None):
     """Run DD4hep simulation
     
@@ -280,6 +305,8 @@ def run_ddsim(input_path, output_path, config, logger=None):
     ddsim.outputFile = str(output_path)
     ddsim.numberOfEvents = config.events if config.events is not None else 10
     ddsim.numberOfThreads = config.threads if config.threads is not None else 1
+    if ddsim.numberOfThreads <= 1 and str(output_path).endswith(".root"):
+        ddsim.outputConfig.userOutputPlugin = single_thread_edm4hep_output
     ddsim.random.enableEventSeed = True
     ddsim.random.seed = getattr(config, 'seed', None) or int(time.time())
     
@@ -299,7 +326,9 @@ def run_ddsim(input_path, output_path, config, logger=None):
     logger.info(f"Output: {output_path}")
     logger.info(f"Random seed: {ddsim.random.seed}")
  
-    ddsim.run()
+    exit_code = ddsim.run()
+    if exit_code:
+        raise RuntimeError(f"DDSim failed with exit code {exit_code}")
 
     
 
@@ -339,6 +368,7 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error in main: {str(e)}")
         logger.error(traceback.format_exc())
+        raise
     finally:
         # Ensure the report is written even if errors occur
         if timer:

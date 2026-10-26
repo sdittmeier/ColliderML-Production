@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Build paired ttbar hit, cell, and particle samples from two EDM4hep inputs."""
+"""Build paired pu0/pu200 hit, cell, and particle samples from EDM4hep inputs."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -75,6 +77,14 @@ def run_command(*parts: str) -> None:
 def run(args: argparse.Namespace) -> dict:
     if args.events < 1:
         raise ValueError("--events must be positive")
+    dataset = getattr(args, "dataset", "ttbar")
+    version = getattr(args, "version", "v1")
+    run_id = getattr(args, "run", 0)
+    for name, value in (("dataset", dataset), ("version", version)):
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+            raise ValueError(f"--{name} must be a nonempty label without spaces or path separators")
+    if not isinstance(run_id, int) or isinstance(run_id, bool) or not 0 <= run_id < 2**32:
+        raise ValueError("--run must be a nonnegative uint32 identifier")
     output = args.output.resolve()
     resume_export = getattr(args, "resume_export", False)
     if output.exists() and not resume_export:
@@ -85,12 +95,20 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("Paired ACTS config and geometric digitization config must exist")
     pixel_quantization = getattr(args, "pixel_quantization", DEFAULT_SCHEME)
     PixelQuantizer(pixel_quantization).validate_digi_config(args.digi_config)
+    digi_sha256 = hashlib.sha256(args.digi_config.read_bytes()).hexdigest()
     with args.digi_config.open() as stream:
         digi = json.load(stream)
     if not digi.get("entries"):
         raise ValueError("Geometric digitization config has no entries")
 
-    inputs = {"pu0": args.input_pu0.resolve(), "pu200": args.input_pu200.resolve()}
+    inputs = {}
+    for sample, _ in SAMPLES:
+        path = getattr(args, f"input_{sample}")
+        if path is None:
+            if dataset != "ttbar":
+                raise ValueError("A non-ttbar dataset requires explicit --input-pu0 and --input-pu200")
+            path = Path(f"/data/{sample}/edm4hep.root")
+        inputs[sample] = path.resolve()
     for sample, path in inputs.items():
         available = input_events(path)
         if available < args.events:
@@ -105,6 +123,27 @@ def run(args: argparse.Namespace) -> dict:
     if not (args.odd_install / "lib/libOpenDataDetector.so").is_file():
         raise ValueError(f"ODD installation not found at {args.odd_install}")
 
+    if resume_export:
+        # Validate both cached samples before overwriting either sample's export.
+        for sample, campaign in SAMPLES:
+            acts_dir = output / sample / "acts"
+            conversion_input = output / "_conversion_input" / sample / "runs" / "0"
+            config = json.loads((output / f"_convert_{sample}.json").read_text())
+            if (config["run_size"] != args.events or config["chunk_size"] != args.events
+                    or config.get("campaign") != campaign
+                    or config.get("dataset") != dataset or config.get("version") != version
+                    or config.get("paired_run", 0) != run_id
+                    or config.get("paired_digi_config_sha256", digi_sha256) != digi_sha256
+                    or (conversion_input / "edm4hep.root").resolve() != inputs[sample]
+                    or (conversion_input / "measurements.root").resolve() != acts_dir / "measurements.root"
+                    or (conversion_input / "particles.root").resolve() != acts_dir / "particles.root"):
+                raise ValueError(f"{sample}: existing conversion inputs or dataset/version/run/config "
+                                 "do not match this run")
+            for path in (acts_dir / "measurements.root", acts_dir / "simhits.root",
+                         acts_dir / "particles.root", acts_dir / "csv"):
+                if not path.exists():
+                    raise ValueError(f"{sample}: missing ACTS output {path}")
+
     if not resume_export:
         output.mkdir(parents=True)
     reports = {}
@@ -114,18 +153,7 @@ def run(args: argparse.Namespace) -> dict:
         conversion_input = output / "_conversion_input" / sample / "runs" / "0"
         conversion_output = output / "_conversion_results"
         config_path = output / f"_convert_{sample}.json"
-        if resume_export:
-            config = json.loads(config_path.read_text())
-            if (config["run_size"] != args.events or config["chunk_size"] != args.events
-                    or config["campaign"] != campaign
-                    or (conversion_input / "edm4hep.root").resolve() != inputs[sample]
-                    or (conversion_input / "measurements.root").resolve() != acts_dir / "measurements.root"):
-                raise ValueError(f"{sample}: existing conversion inputs do not match this run")
-            for path in (acts_dir / "measurements.root", acts_dir / "simhits.root",
-                         acts_dir / "csv"):
-                if not path.exists():
-                    raise ValueError(f"{sample}: missing ACTS output {path}")
-        else:
+        if not resume_export:
             run_command(sys.executable, str(REPO / "scripts/simulation/digi_and_reco.py"),
                         "--config", str(PAIRED_CONFIG), "--events", str(args.events),
                         "--threads", "1", "--digi-config", str(args.digi_config),
@@ -135,7 +163,8 @@ def run(args: argparse.Namespace) -> dict:
             (conversion_input / "measurements.root").symlink_to(acts_dir / "measurements.root")
             (conversion_input / "particles.root").symlink_to(acts_dir / "particles.root")
             config = {
-                "campaign": campaign, "dataset": "ttbar", "version": "v1",
+                "campaign": campaign, "dataset": dataset, "version": version,
+                "paired_run": run_id, "paired_digi_config_sha256": digi_sha256,
                 "common": {"output_base_dir": str(conversion_output)},
                 "input_base_dir": str(conversion_input.parents[1]),
                 "h5_output_dir": str(conversion_output),
@@ -149,13 +178,13 @@ def run(args: argparse.Namespace) -> dict:
             run_command(sys.executable, str(REPO / "scripts/postprocessing/convert_all.py"),
                         "--config", str(config_path), "--chunk-index", "0")
 
-        parquet_root = conversion_output / campaign / "ttbar/v1/parquet"
+        parquet_root = conversion_output / campaign / dataset / version / "parquet"
         converted_hits = one_parquet(parquet_root / "reco/tracker_hits")
         particles = one_parquet(parquet_root / "truth/particles")
         validate_particle_features(particles)
         run_command(sys.executable, str(REPO / "scripts/postprocessing/export_paired_clusters.py"),
-                    "--campaign", campaign, "--dataset", "ttbar", "--version", "v1",
-                    "--run", "0", "--acts-revision", acts_revision, "--odd-revision", odd_revision,
+                    "--campaign", campaign, "--dataset", dataset, "--version", version,
+                    "--run", str(run_id), "--acts-revision", acts_revision, "--odd-revision", odd_revision,
                     "--edm4hep", str(inputs[sample]), "--digi-config", str(args.digi_config),
                     "--measurements-root", str(acts_dir / "measurements.root"),
                     "--simhits-root", str(acts_dir / "simhits.root"),
@@ -163,12 +192,16 @@ def run(args: argparse.Namespace) -> dict:
                     "--particles", str(particles), "--output", str(sample_dir),
                     "--pixel-quantization", pixel_quantization)
         report = json.loads((sample_dir / "report.json").read_text())
+        expected_identity = dict(campaign=campaign, dataset=dataset, version=version, run=run_id)
+        if any(report.get(name) != value for name, value in expected_identity.items()):
+            raise ValueError(f"{sample}: exported dataset/version/run identity does not match this run")
         if report["events"] != args.events or report["local_events"] != list(range(args.events)):
             raise ValueError(f"{sample}: exported events {report['local_events']}, "
                              f"expected {list(range(args.events))}")
         reports[sample] = report
 
-    summary = {"events_per_sample": args.events, "pixel_quantization": pixel_quantization,
+    summary = {"dataset": dataset, "version": version, "run": run_id,
+               "events_per_sample": args.events, "pixel_quantization": pixel_quantization,
                "samples": reports}
     (output / "complete.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
@@ -176,8 +209,14 @@ def run(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-pu0", type=Path, default=Path("/data/pu0/edm4hep.root"))
-    parser.add_argument("--input-pu200", type=Path, default=Path("/data/pu200/edm4hep.root"))
+    parser.add_argument("--dataset", default="ttbar")
+    parser.add_argument("--version", default="v1")
+    parser.add_argument("--run", type=int, default=0,
+                        help="Source run ID in exported keys; event indices stay local to this input")
+    parser.add_argument("--input-pu0", type=Path,
+                        help="Hard-scatter EDM4hep file (ttbar default: /data/pu0/edm4hep.root)")
+    parser.add_argument("--input-pu200", type=Path,
+                        help="Full-pileup EDM4hep file (ttbar default: /data/pu200/edm4hep.root)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--events", type=int, default=1)
     parser.add_argument("--resume-export", action="store_true",

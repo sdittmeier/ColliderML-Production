@@ -557,6 +557,17 @@ def add_root_writers(s, output_dir, field, config=None):
 
     # Write simulated particles if requested
     if output_particles_root:
+        writer_options = {}
+        recovery_limits = {"perigeeRecoveryMaxR": getattr(config, "perigee_recovery_max_r", None),
+                           "perigeeRecoveryMaxAbsZ": getattr(config, "perigee_recovery_max_abs_z", None)}
+        for name, value in recovery_limits.items():
+            if value is None:
+                continue
+            if not hasattr(acts.examples.root.RootParticleWriter.Config(), name):
+                raise RuntimeError(
+                    "Perigee recovery limits require the recovery-only ACTS RootParticleWriter; "
+                    "see docker/acts-perigee/README.md")
+            writer_options[name] = value
         s.addWriter(
             acts.examples.root.RootParticleWriter(
                 config=acts.examples.root.RootParticleWriter.Config(
@@ -565,8 +576,9 @@ def add_root_writers(s, output_dir, field, config=None):
                     referencePoint=acts.Vector3(0.0, 0.0, 0.0),
                     bField=field,
                     writeHelixParameters=write_helix_parameters,
+                    **writer_options,
                 ),
-                level=LOG_LEVEL,
+                level=acts.logging.WARNING if writer_options else LOG_LEVEL,
             )
         )
 

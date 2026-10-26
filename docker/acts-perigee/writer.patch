@@ -1,0 +1,139 @@
+--- a/Examples/Io/Root/src/RootParticleWriter.cpp
++++ b/Examples/Io/Root/src/RootParticleWriter.cpp
+@@ -7,6 +7,8 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ #include "ActsExamples/Io/Root/RootParticleWriter.hpp"
++#include "ActsExamples/Io/Root/detail/TruthPerigee.hpp"
++#include "PerigeePatchVersion.hpp"
+ 
+ #include "Acts/Definitions/TrackParametrization.hpp"
+ #include "Acts/Definitions/Units.hpp"
+@@ -25,6 +27,9 @@
+ 
+ #include <TFile.h>
+ #include <TTree.h>
++#include <TNamed.h>
++#include <sstream>
++#include <iomanip>
+ 
+ namespace ActsExamples {
+ 
+@@ -39,6 +44,13 @@
+     throw std::invalid_argument("Missing tree name");
+   }
+ 
++  if (m_cfg.writeHelixParameters && !m_cfg.bField) {
++    throw std::invalid_argument("Helix parameters require a magnetic field");
++  }
++  if (!std::isfinite(m_cfg.perigeeRecoveryMaxR) || m_cfg.perigeeRecoveryMaxR <= 0. ||
++      !std::isfinite(m_cfg.perigeeRecoveryMaxAbsZ) || m_cfg.perigeeRecoveryMaxAbsZ <= 0.) {
++    throw std::invalid_argument("Perigee recovery limits must be finite and positive");
++  }
+   // open root file and create the tree
+   m_outputFile = TFile::Open(m_cfg.filePath.c_str(), m_cfg.fileMode.c_str());
+   if (m_outputFile == nullptr) {
+@@ -106,6 +118,17 @@
+ ProcessCode RootParticleWriter::finalize() {
+   m_outputFile->cd();
+   m_outputTree->Write();
++  std::ostringstream provenance;
++  provenance << std::setprecision(17)
++             << "{\"algorithm\":\"writer-recovery-v2\",\"acts_base_revision\":\""
++             << COLLIDERML_ACTS_BASE_REVISION << "\",\"patch_sha256\":\""
++             << COLLIDERML_PERIGEE_PATCH_SHA256 << "\",\"write_helix_parameters\":"
++             << (m_cfg.writeHelixParameters ? "true" : "false")
++             << ",\"preserve_legacy_finite\":true,\"boundary_splitting\":false"
++             << ",\"recovery_max_r_mm\":" << m_cfg.perigeeRecoveryMaxR
++             << ",\"recovery_max_abs_z_mm\":" << m_cfg.perigeeRecoveryMaxAbsZ << "}";
++  TNamed patchMetadata("colliderml_perigee_writer", provenance.str().c_str());
++  patchMetadata.Write();
+   m_outputFile->Close();
+ 
+   ACTS_INFO("Wrote particles to tree '" << m_cfg.treeName << "' in '"
+@@ -259,34 +282,16 @@
+     }
+ 
+     ++m_nCharged;
+-    // Charged particles: propagate helix to perigee
+-    // Build a propagator and propagate the *truth parameters* to the perigee.
+-    // Use a logger cloned from the writer logger so the propagator respects
+-    // the same logging level as this writer.
+-    using Stepper = Acts::SympyStepper;
+-    Stepper stepper(m_cfg.bField);
+-    using PropagatorT = Acts::Propagator<Stepper>;
+-    auto propagatorLogger = std::shared_ptr<const Acts::Logger>(
+-        logger().cloneWithSuffix("PerigeePropagator"));
+-    auto propagator = std::make_shared<PropagatorT>(
+-        stepper, typename PropagatorT::Navigator{}, std::move(propagatorLogger));
+-
+-    Acts::BoundTrackParameters startParams =
+-        Acts::BoundTrackParameters::createCurvilinear(
+-            particle.fourPosition(), startDir, qOverP, std::nullopt,
+-            Acts::ParticleHypothesis::pion());
+-
+-    // Propagation options (need event contexts)
+-    using PropOptions = PropagatorT::Options<>;
+-    PropOptions pOptions(ctx.geoContext, ctx.magFieldContext);
+-
+-    // Choose propagation direction based on the closest intersection
+-    pOptions.direction =
+-        Acts::Direction::fromScalarZeroAsPositive(intersection.pathLength());
+-
+-    // Do the propagation to the perigee surface
+-    auto propRes = propagator->propagate(startParams, *pSurface, pOptions);
+-    if (!propRes.ok() || !propRes->endParameters.has_value()) {
++    // Recovery-only policy: preserve successful legacy output; retry failures.
++    auto startParams = Acts::BoundTrackParameters::createCurvilinear(
++        particle.fourPosition(), startDir, qOverP, std::nullopt,
++        Acts::ParticleHypothesis::pion());
++    auto propRes = detail::truthPerigee(
++        ctx.geoContext, ctx.magFieldContext, startParams, pSurface, m_cfg.bField,
++        m_cfg.perigeeRecoveryMaxR, m_cfg.perigeeRecoveryMaxAbsZ, logger());
++    if (!propRes.parameters.has_value()) {
++      ACTS_DEBUG("Perigee recovery failure for particle "
++                 << particle.particleId().hash() << ": " << propRes.error);
+       ++m_nPropagationFailed;
+       m_perigeePhi.push_back(NaNfloat);
+       m_perigeeTheta.push_back(NaNfloat);
+@@ -301,7 +306,7 @@
+       m_perigeePt.push_back(NaNfloat);
+       continue;
+     }
+-    const Acts::BoundTrackParameters& atPerigee = *propRes->endParameters;
++    const Acts::BoundTrackParameters& atPerigee = *propRes.parameters;
+ 
+     // By construction, atPerigee is *bound on the perigee surface*.
+     // Its parameter vector is [loc0, loc1, phi, theta, q/p, t]
+--- a/Examples/Io/Root/include/ActsExamples/Io/Root/RootParticleWriter.hpp
++++ b/Examples/Io/Root/include/ActsExamples/Io/Root/RootParticleWriter.hpp
+@@ -16,6 +16,7 @@
+ 
+ #include <cstdint>
+ #include <mutex>
++#include <limits>
+ #include <string>
+ #include <vector>
+ 
+@@ -51,6 +52,9 @@
+     std::shared_ptr<Acts::MagneticFieldProvider> bField;
+     /// Flag to enable writing of helix parameters.
+     bool writeHelixParameters = false;
++    /// Recovery-only domain in ACTS mm. Legacy finite results are unrestricted.
++    double perigeeRecoveryMaxR = std::numeric_limits<double>::max();
++    double perigeeRecoveryMaxAbsZ = std::numeric_limits<double>::max();
+   };
+ 
+   /// Construct the particle writer.
+--- a/Python/Examples/src/plugins/Root.cpp
++++ b/Python/Examples/src/plugins/Root.cpp
+@@ -141,7 +141,8 @@
+ 
+     ACTS_PYTHON_DECLARE_WRITER(RootParticleWriter, root, "RootParticleWriter",
+                                inputParticles, filePath, fileMode, treeName,
+-                               referencePoint, bField, writeHelixParameters);
++                               referencePoint, bField, writeHelixParameters,
++                               perigeeRecoveryMaxR, perigeeRecoveryMaxAbsZ);
+ 
+     ACTS_PYTHON_DECLARE_WRITER(RootVertexWriter, root, "RootVertexWriter",
+                                inputVertices, filePath, fileMode, treeName);

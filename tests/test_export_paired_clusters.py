@@ -194,6 +194,25 @@ class PairedClusterExportTest(unittest.TestCase):
             exporter.export(self.args)
         self.assertFalse(self.args.output.exists())
 
+    def test_nonzero_source_runs_preserve_local_particle_and_measurement_ids(self) -> None:
+        self.args.dataset, self.args.version = "higgs_portal", "v2"
+        self.write_converted()
+        keys = []
+        for run in (17, 18):
+            self.args.run = run
+            self.args.output = self.base / f"run{run}"
+            report = exporter.export(self.args)
+            self.assertEqual((report["dataset"], report["version"], report["run"]),
+                             ("higgs_portal", "v2", run))
+            hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+            cells = pq.read_table(self.args.output / "cells.parquet").to_pylist()
+            self.assertEqual([hit["local_event"] for hit in hits], [0, 0])
+            self.assertEqual([hit["measurement_id"] for hit in hits], [0, 1])
+            self.assertTrue(all(cell["run"] == run for cell in cells))
+            self.assertEqual(pq.read_table(self.args.output / "particles.parquet")["event_id"].to_pylist(), [0])
+            keys.append({tuple(hit[name] for name in exporter.KEY_FIELDS) for hit in hits})
+        self.assertTrue(keys[0].isdisjoint(keys[1]))
+
     def test_rejects_unknown_particle_label(self) -> None:
         self.write_converted(labels=(4, 99))
         with self.assertRaisesRegex(ValueError, "absent from particles"):

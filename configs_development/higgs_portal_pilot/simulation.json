@@ -1,0 +1,13 @@
+{
+  "events": 1,
+  "threads": 1,
+  "minimalKineticEnergy": 0.1,
+  "truthParticleHandler": "Geant4FullTruthParticleHandler",
+  "alternative_decay_statuses": [22],
+  "extra_reject_pdgs": [35],
+  "vertexOffset": [0.0, 0.0, 0.0, 0.0],
+  "vertexSigma": [0.0, 0.0, 0.0, 0.0],
+  "ddsim_printLevel": 4,
+  "filter_g4_warnings": true,
+  "physics_list": "FTFP_BERT"
+}

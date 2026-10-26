@@ -97,6 +97,14 @@ def repo_revision() -> str:
                                     "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 
 
+def perigee_writer_provenance(path: Path) -> dict | None:
+    """Read the writer identity from the actual input, never the current runtime."""
+    with uproot.open(path) as source:
+        if "colliderml_perigee_writer" not in source:
+            return None
+        return json.loads(source["colliderml_perigee_writer"].member("fTitle"))
+
+
 def root_measurements(path: Path) -> dict[int, list[dict]]:
     if not path.is_file():
         raise ValueError(f"Missing ROOT measurements: {path}")
@@ -403,6 +411,9 @@ def export(args: argparse.Namespace) -> dict:
         raise ValueError("Digitization produced no hits or no cells")
 
     particle_feature_coverage = None
+    particles_root = args.measurements_root.with_name("particles.root")
+    writer_provenance = (perigee_writer_provenance(particles_root)
+                         if particles_path and particles_root.is_file() else None)
     if particles is not None:
         particle_feature_coverage = {}
         for name in ("perigee_d0", "perigee_z0", "vertex_primary"):
@@ -422,6 +433,7 @@ def export(args: argparse.Namespace) -> dict:
         "multi_contributor_measurements": sum(len(hit["simhit_ids"]) > 1 for hit in hits),
         "particles": particle_count if particles is not None else None,
         "particle_feature_coverage": particle_feature_coverage,
+        "perigee_writer": writer_provenance,
         "null_particle_labels": null_labels if particles is not None else None,
         "multi_particle_measurements": multi_particle_measurements if simhits_root_path else None,
         "simhit_truth_barcode_fallbacks": simhit_truth_fallbacks if simhits_root_path else None,
@@ -446,7 +458,8 @@ def export(args: argparse.Namespace) -> dict:
         "inputs": {str(path): sha256(path) for path in
                    (args.edm4hep, args.digi_config, args.measurements_root,
                     *([converted_hits_path, particles_path] if converted_hits_path else []),
-                    *([simhits_root_path] if simhits_root_path else []))},
+                    *([simhits_root_path] if simhits_root_path else []),
+                    *([particles_root] if particles_path and particles_root.is_file() else []))},
     }
     args.output.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(hits, schema=HIT_SCHEMA), args.output / "hits.parquet")

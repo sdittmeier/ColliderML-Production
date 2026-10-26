@@ -1,7 +1,9 @@
-# Paired ttbar cluster samples
+# Paired cluster samples
 
 One command builds hits, constituent cells, and particles from the first N
 events of each hard-scatter and full-pileup EDM4hep file. N defaults to 1.
+The defaults remain `--dataset ttbar --version v1 --run 0`, producing both
+pu0 and pu200. Other processes use the same flow with explicit input files.
 ACTS digitization and the existing production particle/tracker-hit converter
 run on the same input events. The exporter checks their alignment before
 adding particle truth to each paired hit. It retains all `simhit_ids` and
@@ -58,6 +60,14 @@ sudo docker build -f docker/acts-arrow/Dockerfile \
   -t colliderml-acts:7cba36b17 .
 ```
 
+The current paired configuration also requires the
+[truth-perigee writer patch](../../docker/acts-perigee/README.md). Apply that
+small rebuild to a freshly built base image before running. On this host the
+existing image tag is updated after its validation. The patch records its
+identity in `particles.root` and `report.json`; an older runtime fails clearly
+when the explicit ODD recovery limits are requested. Existing
+samples retain their original perigees until rerun into a new output directory.
+
 ## Run in Docker
 
 Start the container with the prepared cache and inputs:
@@ -109,7 +119,10 @@ python3 /workspace/scripts/postprocessing/run_paired_samples.py \
 ```
 
 The resume command checks the existing input links, event count, ACTS files,
-and conversion files. It does not rerun ACTS or the production converter.
+and conversion identity (campaign, dataset, version and source run). Both
+samples are checked before either export is overwritten. New runs also record
+the digitization-configuration checksum and require it to match on resume.
+It does not rerun ACTS or the production converter.
 It uses the requested quantization option (default P99.9), even if the
 original attempt used a different option; the final reports record it.
 It cannot add perigee/vertex fields to an older run without `particles.root`.
@@ -184,6 +197,67 @@ The particle table comes from EDM4hep, enriched with ACTS-derived
 `perigee_d0`, `perigee_z0`, and `vertex_primary` from `particles.root`.
 Unmatched EDM particles are retained with null enrichment fields, and the
 report gives per-field coverage.
+
+## Other processes and source runs
+
+For a fresh Higgs-portal + pu200 Geant4 pilot from a new bash shell, use the
+[corrected Higgs-portal pilot instructions](../higgs_portal_pilot/README.md).
+They prepare actual simulated pu200 inputs before invoking this paired exporter.
+
+`--dataset`, `--version` and `--run` label the actual input data; they do not
+generate a process, add pileup, select a new detector configuration, or inspect
+the physics content to verify a dataset name. For a non-ttbar dataset, **both
+`--input-pu0` and `--input-pu200` must be explicit** to avoid silently relabelling
+the default ttbar files. Both pileup settings are still always processed.
+
+Once suitable Higgs-portal EDM4hep files have been obtained, the command inside
+the same configured Docker environment would be:
+
+```bash
+# Illustrative paths: these inputs must be supplied before running.
+python3 /workspace/scripts/postprocessing/run_paired_samples.py \
+  --dataset higgs_portal --version v1 --run 0 \
+  --input-pu0 /data/higgs_portal/pu0/runs/0/edm4hep.root \
+  --input-pu200 /data/higgs_portal/pu200/runs/0/edm4hep.root \
+  --events 1 \
+  --output /output/higgs-portal-v1-run0-n1
+```
+
+Input availability and Higgs-portal generation/overlay are separate tasks; this
+runner assumes already simulated inputs. Pileup-event allocation and non-reuse
+are not controlled here. The `higgs_portal` label is configurable, not a model
+definition or choice of lifetime/mass parameters.
+
+Use one invocation per source run, with a new output directory and matching
+pu0/pu200 input paths. For the next source run, change the two paths, `--run 1`,
+and the output directory. The runner does not scan or concatenate multiple
+files. Callers must assign distinct run IDs within a campaign/dataset/version;
+the runner cannot enforce uniqueness across independent output directories.
+
+`--run` must fit a nonnegative uint32. Dataset/version labels must start with an
+ASCII letter or digit and otherwise contain only letters, digits, `_`, `-`, or
+`.`. The metadata is passed through conversion filenames and paths, final
+hit/cell keys, sample reports and the top-level `complete.json`.
+
+Event numbering deliberately stays **local to each input file**, from 0 to N-1.
+The converter uses an isolated temporary `runs/0` even when the source run ID is
+nonzero, avoiding its global-event offset convention. Final hit/cell keys carry
+the requested source `run`; measurement IDs still restart for each event.
+`particles.parquet` keeps the existing event-row schema with local `event_id`:
+join using the same sample/run context and local event, not `event_id` alone
+across concatenated source runs. Its particle IDs remain event-local as well.
+
+On `--resume-export`, repeat the same dataset, version, run, input paths and
+event count. Older conversion configs without `paired_run` are accepted only
+as source run 0; they predate the recorded digitization checksum. Completed
+directories are still protected against pipeline overwrites. No converter,
+exporter truth algorithm or ACTS settings change with the process label.
+
+Native activations are retained and P99.9 pixel codes remain the default. These
+use the **frozen ttbar-derived calibration**, including on Higgs-portal inputs;
+they are not refitted for a new process. Calibration portability to displaced
+tracks still needs validation. Use `--pixel-quantization none` to disable the
+optional codes while preserving the otherwise identical workflow.
 
 ## Pixel quantization
 

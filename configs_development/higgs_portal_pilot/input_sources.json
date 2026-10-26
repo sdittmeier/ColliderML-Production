@@ -1,0 +1,28 @@
+{
+  "source_dataset": "hard_scatter/higgs_portal/v2",
+  "source_run": 0,
+  "source_events": 1000,
+  "checked_on": "2026-10-23",
+  "physics": {"higgs_mass_GeV": 125.0, "llp_mass_GeV": 55.0, "llp_ctau_mm": 100.0, "llp_pdg": 36, "decay": "h -> aa -> b bbar b bbar"},
+  "inputs": {
+    "pu0": {
+      "url": "https://portal.nersc.gov/cfs/m4958/ColliderML/hard_scatter/higgs_portal/v2/runs/0/edm4hep.root",
+      "relative_path": "pu0/run0/edm4hep.root",
+      "bytes": 3077055498
+    },
+    "signal": {
+      "url": "https://portal.nersc.gov/cfs/m4958/ColliderML/hard_scatter/higgs_portal/v2/runs/0/events_signal.hepmc3",
+      "relative_path": "signal/run0/events_signal.hepmc3",
+      "bytes": 262564237,
+      "md5": "e34d4662b948553fafc8435ab3090b9b"
+    }
+  },
+  "references": {
+    "production_log": "https://portal.nersc.gov/cfs/m4958/ColliderML/hard_scatter/higgs_portal/v2/PRODUCTION_LOG.md",
+    "manifest": "https://portal.nersc.gov/cfs/m4958/ColliderML/hard_scatter/higgs_portal/v2/manifest_v2.csv",
+    "validation": "https://portal.nersc.gov/cfs/m4958/ColliderML/hard_scatter/higgs_portal/v2/validation_10k/README.md",
+    "dd4hep_physics": "https://github.com/AIDASoft/DD4hep/blob/a3fdbc4302494ee6dad3e3da460ec42b2b61c99f/DDG4/python/DDSim/Helper/Physics.py",
+    "dd4hep_extra_particles": "https://github.com/AIDASoft/DD4hep/blob/a3fdbc4302494ee6dad3e3da460ec42b2b61c99f/DDG4/plugins/Geant4ExtraParticles.cpp",
+    "acts_reader": "https://github.com/murnanedaniel/acts/blob/7cba36b173dd73a14342cc65043a43179a4b1dbd/Examples/Io/HepMC3/src/HepMC3Reader.cpp"
+  }
+}

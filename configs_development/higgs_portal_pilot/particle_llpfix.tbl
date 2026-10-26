@@ -1,0 +1,7 @@
+// Override for the full existing Higgs-portal particle.tbl, not a replacement.
+// The pilot changes only the PDG 36 record and preserves all other definitions.
+// DD4hep Geant4ExtraParticles interprets the last column as c*tau in mm.
+// A width of -1 marks PDG 36 unstable BEFORE DD4hep computes its width
+// from the positive lifetime. Width 0 would incorrectly mark it stable.
+// ID name charge_in_thirds mass_GeV width_flag ctau_mm
+36 H_3^0 0 55.0 -1.0 100.0

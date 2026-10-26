@@ -1,4 +1,75 @@
-# Paired vs published event notebook
+# Paired sample validation notebooks
+
+## Higgs-portal pilot
+
+`higgs_portal_pilot.ipynb` validates the copied Higgs-portal output at
+`exports/higgs-portal-pilot-run1-n1/paired` by default. Change `PILOT_ROOT` and
+`EVENT` in its configuration cell for another pilot/event. No ACTS, Docker,
+PyTorch or additional input download is needed. Use the same regular plotting
+environment described below (also providing IPython through `ipykernel`):
+
+```bash
+conda activate paired-validation
+cd /home/atlas/dittmeier/git/cluster_extraction/ColliderML-Production
+python -m jupyter lab notebooks/validation/higgs_portal_pilot.ipynb
+```
+
+Pu0 is blue, pu200 green, with common bins and normalized overlays. These are
+**independent hard-scatter events**, not a controlled same-event pileup pair.
+The current pu0 source ROOT entry corresponds to original event 7; pu200 uses
+signal event 0. Identical local event IDs do not imply event matching.
+
+The notebook checks completion/simulation evidence, full-key cell-hit joins,
+particle contributors and scalar labels, ROOT-derived count reports, schemas,
+non-finite values, frozen pixel codes and unchanged source Parquet checksums.
+It reports legacy coordinate-label disagreements separately from unresolved
+SimHit truth. A nullable scalar label does not imply a missing contributor list.
+
+Plots cover particle kinematics/types/perigee parameters, production vertices,
+hit detector coverage and local/global positions, cluster sizes, contributor
+groups, activation tails and pixel codes. It includes six distinct cluster
+sizes per detector type when available. `PARTICLE_COHORT` defaults to generator-origin
+charged particles with tracker SimHits, excluding material secondaries but not
+pileup generator particles; `GALLERY_SAMPLE` defaults to pu200. Only spatial
+views are sampled; counts and histograms use all selected-event entries.
+
+Particle `vx/vy/vz` are production vertices, not LLP decay endpoints. The saved
+simulation report checks LLP endpoints separately. This pilot does not establish
+tracking efficiency, reconstructed lifetime/mass, position resolution or
+event-matched pileup effects. The frozen P99.9 code mapping is checked, not
+refitted to Higgs portal. All analysis is in memory and source files stay unchanged.
+
+The cause of missing truth-perigee values and the read-only ACTS replay tools
+are documented in [perigee_diagnosis.md](perigee_diagnosis.md). These diagnostics
+are separate from production; do not interpret their candidate parameters as
+an applied correction to the stored samples.
+
+The [current writer patch](../../docker/acts-perigee/README.md) uses a
+**recovery-only** policy: retain legacy finite values, retry only failures inside
+the configured ODD central-field region, and perform no boundary splitting.
+The older boundary-correcting `writer-v1` reports under `validation/perigee_writer/`
+and `/tmp/colliderml-paired-40167/output/perigee-writer-smoke` are historical.
+See the patch README for current output paths and production validation results.
+
+The **Current stored truth-perigee validation** section tests the new files at
+`PAIRED_ROOT`, using the original-event reference under
+`PILOT_ROOT/validation/perigee_reference`. That reference is hash-checked against
+`BASELINE_PAIRED_ROOT`, which defaults to `PILOT_ROOT/paired.before-recovery-v2`.
+Current particle membership and all non-perigee features must match the baseline;
+every legacy finite perigee must remain exact, and new recoveries must agree with
+the independent reference. ROOT provenance and its input checksum are checked.
+The table displays the actual current particle-file paths and writer version.
+
+Residual plots now use current stored Parquet d0/z0 values. The expected selected
+cohort has 20 recovered pu0 and 249 recovered pu200 particles, one unresolved
+particle per sample, and two intentionally preserved finite pu200 reference
+discrepancies. The latter appear as `legacy_mismatch_preserved`, not failed new
+recoveries. Uniform-field and convergence tables describe the independent
+reference; no stale ACTS candidate or propagation-path results are presented as
+current stored values. The original reference files remain unchanged. Only the
+affected final notebook outputs have been refreshed; other outputs are preserved.
+
+## Paired vs published ttbar
 
 `paired_vs_published.ipynb` compares one new ttbar event with one independent
 published event. It defaults to new pu0 event 25 (held out from empirical

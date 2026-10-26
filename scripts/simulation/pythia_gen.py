@@ -257,6 +257,7 @@ def generate_pileup(output_dir, config, logger):
 
 def find_hard_scatter_file(output_dir, config, explicit_path=None):
     """Find hard scatter file with smart detection."""
+    explicit_path = Path(explicit_path) if explicit_path else None
     if explicit_path and explicit_path.exists():
         return explicit_path
     
@@ -283,6 +284,7 @@ def find_hard_scatter_file(output_dir, config, explicit_path=None):
 
 def find_pileup_file(output_dir, config, explicit_path=None):
     """Find pileup file with smart detection."""
+    explicit_path = Path(explicit_path) if explicit_path else None
     if explicit_path and explicit_path.exists():
         return explicit_path
     
