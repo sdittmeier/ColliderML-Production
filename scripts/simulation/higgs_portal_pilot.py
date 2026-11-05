@@ -451,6 +451,8 @@ def command(parts, logfile):
 
 
 def run(args):
+    from scripts.postprocessing.utils.paired_schema import event_offset
+    offset = event_offset(getattr(args, "event_id_offset", None), args.run, args.events)
     if args.events < 1 or args.threads < 1 or not 0 <= args.run < 2**32 or args.signal_start < 0:
         raise ValueError("Require positive events/threads, nonnegative signal start, and a uint32 run ID")
     sources = json.loads((CONFIG / "input_sources.json").read_text())
@@ -475,6 +477,16 @@ def run(args):
         seed = production_seed(args.seed_namespace, args.run, "generation")
         reservation = reserve_pileup(args.registry, args.seed_namespace, args.run, seed + 1000, output)
         output.mkdir(parents=True)
+        pu0_input = args.input_pu0
+        pu0_selection = dict(source_entry_start=0, source_entry_stop_exclusive=args.events,
+                             events=args.events, policy="Original source file; first requested entries")
+        if args.signal_start:
+            from scripts.simulation.recover_duplicate_events import select_event_range
+            pu0_input = output / "inputs/pu0/edm4hep.root"
+            print(f"Selecting pu0 ROOT entries {args.signal_start}..{args.signal_start + args.events - 1}", flush=True)
+            pu0_selection = select_event_range(args.input_pu0, pu0_input, args.signal_start, args.events)
+        pu0_selection.update(path=str(pu0_input), sha256=checksum(pu0_input))
+        write_json(output / "pu0_selection.json", pu0_selection)
         write_particle_table(output / "particle_llpfix.tbl")
         generation = output / "generation"
         generation.mkdir()
@@ -485,8 +497,9 @@ def run(args):
                                  hard_scatter_file=str(selected), vertex_sigma_xy=.0125,
                                  vertex_sigma_z=55.5, vertex_sigma_t=.185)
         write_json(output / "generation.json", generation_config)
-        manifest = dict(dataset="higgs_portal", version="v2_cells_pilot", run=args.run,
+        manifest = dict(dataset="higgs_portal", version="v2_cells_compat1", run=args.run, event_id_offset=offset,
                         events=args.events, signal_start=args.signal_start, runtime=runtime,
+                        pu0_selection=pu0_selection,
                         source_checksums=source_checksums, source_dataset=sources["source_dataset"],
                         physics=sources["physics"], selected_signal_events=selected_events,
                         input_sha256={str(args.signal): checksum(args.signal), str(args.input_pu0): checksum(args.input_pu0)},
@@ -526,6 +539,7 @@ def run(args):
         if (not manifest.get("prepared") or not code_matches
                 or manifest["run"] != args.run or manifest["events"] != args.events
                 or manifest["signal_start"] != args.signal_start
+                or manifest.get("event_id_offset", 0) != offset
                 or manifest["pileup_reservation"]["namespace"] != args.seed_namespace):
             raise ValueError("Existing pilot metadata does not match the requested run/code/events")
     if args.stage == "recover":
@@ -620,9 +634,12 @@ def run(args):
             raise ValueError("Simulation validation/checksum gate must pass before export")
         if checksum(args.input_pu0) != manifest["input_sha256"].get(str(args.input_pu0)):
             raise ValueError("Corrected pu0 reference changed after preparation")
+        pu0_input = Path(manifest.get("pu0_selection", {}).get("path", str(args.input_pu0)))
+        if manifest.get("pu0_selection") and checksum(pu0_input) != manifest["pu0_selection"]["sha256"]:
+            raise ValueError("Selected pu0 input changed after preparation")
         elapsed = command([sys.executable, REPO / "scripts/postprocessing/run_paired_samples.py",
                            "--dataset", manifest["dataset"], "--version", manifest["version"],
-                           "--run", args.run, "--events", args.events, "--input-pu0", args.input_pu0,
+                           "--run", args.run, "--event-id-offset", offset, "--events", args.events, "--input-pu0", pu0_input,
                            "--input-pu200", simulated, "--pixel-quantization", "p99.9",
                            "--output", output / "paired"], output / "export.log")
         completed = json.loads((output / "paired/complete.json").read_text())
@@ -630,6 +647,8 @@ def run(args):
                 or completed.get("version") != manifest["version"]
                 or completed.get("run") != args.run
                 or completed.get("events_per_sample") != args.events
+                or completed.get("event_id_start") != offset
+                or completed.get("event_id_stop_exclusive") != offset + args.events
                 or set(completed.get("samples", {})) != {"pu0", "pu200"}):
             raise ValueError("Paired export completion marker does not match this pilot")
         manifest["timings_seconds"]["digitization_conversion_export"] = elapsed
@@ -645,6 +664,7 @@ def main():
     parser.add_argument("--events", type=int, default=1)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--run", type=int, default=0)
+    parser.add_argument("--event-id-offset", type=int, help="Global event range start; required for nonzero runs")
     parser.add_argument("--signal-start", type=int, default=0)
     parser.add_argument("--stage", choices=("all", "prepare", "simulate", "recover", "validate", "export"), default="all")
     parser.add_argument("--seed-namespace", default="colliderml-higgs-portal-cells-pilot-2026-10")

@@ -6,6 +6,7 @@ import json
 import math
 import numpy as np
 import os
+import subprocess
 from pathlib import Path
 import shutil
 import tempfile
@@ -36,6 +37,40 @@ class GenerationFileLookupTest(unittest.TestCase):
                 exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
                 for explicit in (str(path), path):
                     self.assertEqual(scope[name](Path(folder), SimpleNamespace(), explicit), path)
+
+
+class PilotLauncherLimitsTest(unittest.TestCase):
+    def test_docker_limits_follow_slurm_allocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "bin"
+            binary.mkdir()
+            for name, contents in {
+                "docker": '#!/bin/sh\nprintf "%s\\n" "$@" >> "$CLUSTER_DOCKER_LOG"\n',
+                "python3": "#!/bin/sh\nexit 0\n",
+            }.items():
+                path = binary / name
+                path.write_text(contents)
+                path.chmod(0o755)
+            geometry = root / "scratch/cache/odd-v4/xml/OpenDataDetector.xml"
+            geometry.parent.mkdir(parents=True)
+            geometry.touch()
+            log = root / "docker-args"
+            environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                               CLUSTER_ROOT=str(root / "project"), CLUSTER_SCRATCH=str(root / "scratch"),
+                               CLUSTER_DOCKER_LOG=str(log), SLURM_CPUS_PER_TASK="25", SLURM_MEM_PER_NODE="196608")
+            subprocess.run(["bash", str(pilot.REPO / "scripts/cli/run_higgs_portal_pilot.sh"),
+                            "--events", "100"], env=environment, check=True, capture_output=True)
+            args = log.read_text().splitlines()
+            self.assertEqual(args[args.index("--cpus") + 1], "25")
+            self.assertEqual(args[args.index("--memory") + 1], "196608m")
+            log.unlink()
+            environment.pop("SLURM_CPUS_PER_TASK")
+            environment.pop("SLURM_MEM_PER_NODE")
+            subprocess.run(["bash", str(pilot.REPO / "scripts/cli/run_higgs_portal_pilot.sh")],
+                           env=environment, check=True, capture_output=True)
+            self.assertNotIn("--cpus", log.read_text().splitlines())
+            self.assertNotIn("--memory", log.read_text().splitlines())
 
 
 class Geant4DataPathsTest(unittest.TestCase):
@@ -237,7 +272,7 @@ class HiggsPortalPilotTest(unittest.TestCase):
                         merged_sha256=pilot.checksum(merged),
                         particle_table_sha256=pilot.checksum(output / "particle_llpfix.tbl"))
         pilot.write_json(output / "pilot.json", manifest)
-        args = SimpleNamespace(output=output, events=1, threads=1, run=1, signal_start=0,
+        args = SimpleNamespace(output=output, events=1, threads=1, run=1, event_id_offset=0, signal_start=0,
                                stage="recover", seed_namespace="test")
 
         def fake_recover(source, destination, events):
@@ -346,18 +381,24 @@ class HiggsPortalPilotTest(unittest.TestCase):
             verify(path, {**spec, "md5": "wrong"})
 
     def test_full_pilot_orchestration_and_staged_reuse_without_running_physics(self):
+        self.orchestrate(0)
+
+    def test_next_shard_advances_pu0_and_signal_and_checks_selected_input(self):
+        self.orchestrate(2)
+
+    def orchestrate(self, signal_start):
         config = self.root / "config"
         shutil.copytree(pilot.CONFIG, config)
         signal, pu0 = self.root / "signal.hepmc3", self.root / "pu0.root"
-        self.signal(signal)
-        self.edm(pu0)
+        self.signal(signal, numbers=(0, 1, 2, 3))
+        self.edm(pu0, numbers=(0, 1, 2, 3))
         sources = json.loads((config / "input_sources.json").read_text())
-        sources["source_events"] = 2
+        sources["source_events"] = 4
         sources["inputs"]["signal"].update(bytes=signal.stat().st_size, md5=pilot.checksum(signal, "md5"))
         sources["inputs"]["pu0"]["bytes"] = pu0.stat().st_size
         (config / "input_sources.json").write_text(json.dumps(sources))
         args = SimpleNamespace(output=self.root / "pilot", events=2, threads=8, run=17,
-                               signal_start=0, stage="prepare", seed_namespace="unit-test",
+                               event_id_offset=100, signal_start=signal_start, stage="prepare", seed_namespace="unit-test",
                                registry=self.root / "registry.json", signal=signal, input_pu0=pu0)
         calls = []
 
@@ -372,21 +413,39 @@ class HiggsPortalPilotTest(unittest.TestCase):
                 shutil.copyfile(destination / "selected_signal.hepmc3", destination / "merged_events.hepmc3")
             elif script.endswith("ddsim_run.py"):
                 destination.mkdir(parents=True)
-                self.edm(destination / "edm4hep.root")
+                target = destination / "edm4hep.root"
+                self.edm(target, numbers=(signal_start + 1, signal_start))
+                with uproot.open(target) as handle:
+                    arrays = handle["events"].arrays(library="ak", how=dict)
+                arrays["EventHeader/EventHeader.eventNumber"] = ak.Array([[1], [0]])
+                with uproot.recreate(target) as handle:
+                    handle["events"] = arrays
             elif script.endswith("run_paired_samples.py"):
                 destination.mkdir()
-                complete = dict(dataset="higgs_portal", version="v2_cells_pilot", run=17,
+                complete = dict(dataset="higgs_portal", version="v2_cells_compat1", run=17,
+                                event_id_start=100,event_id_stop_exclusive=102,
                                 events_per_sample=2, samples={"pu0": {}, "pu200": {}})
                 (destination / "complete.json").write_text(json.dumps(complete))
             else:
                 raise AssertionError(script)
             return .125
 
+        def fake_select(source, destination, start, events):
+            self.assertEqual(source, pu0)
+            self.assertEqual((start, events), (signal_start, 2))
+            destination.parent.mkdir(parents=True)
+            self.edm(destination, numbers=range(start, start + events))
+            return dict(source_entry_start=start, source_entry_stop_exclusive=start + events, events=events)
+
+        from scripts.simulation import recover_duplicate_events
         with patch.object(pilot, "CONFIG", config), \
              patch.object(pilot, "runtime_preflight", return_value={"mocked": True}), \
+             patch.object(recover_duplicate_events, "select_event_range", side_effect=fake_select) as selection, \
              patch.object(pilot, "command", side_effect=fake_command):
             prepared = pilot.run(args)
             self.assertTrue(prepared["prepared"])
+            self.assertEqual(prepared["pu0_selection"]["source_entry_start"], signal_start)
+            self.assertEqual(selection.call_count, int(signal_start > 0))
             self.assertEqual(prepared["generated_pileup_events"], 500)
             self.assertEqual(prepared["reserved_pileup_source_id_range"], [0, 499])
             self.assertEqual(len(calls), 1)
@@ -410,7 +469,17 @@ class HiggsPortalPilotTest(unittest.TestCase):
                 pilot.run(args)
             args.threads = 8
             args.stage = "export"
+            good_manifest = (args.output / "pilot.json").read_text()
+            damaged = json.loads(good_manifest)
+            damaged["pu0_selection"]["sha256"] = "wrong"
+            (args.output / "pilot.json").write_text(json.dumps(damaged))
+            with self.assertRaisesRegex(ValueError, "Selected pu0 input changed"):
+                pilot.run(args)
+            (args.output / "pilot.json").write_text(good_manifest)
             finished = pilot.run(args)
+            export_call = calls[-1]
+            self.assertEqual(str(export_call[export_call.index("--input-pu0") + 1]),
+                             prepared["pu0_selection"]["path"])
             self.assertTrue(finished["complete"])
             self.assertEqual(len(calls), 3)
             self.assertEqual(len(json.loads(args.registry.read_text())), 1)

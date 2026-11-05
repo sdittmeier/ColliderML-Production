@@ -1,9 +1,18 @@
 # Paired sample validation notebooks
 
+## Compatible schema and old inputs
+
+The loader supports original flat paired files and new CERN-style nested hits.
+Analysis frames use `x/y/z` and `event_id`. It selects the correct manifest shard
+and flattens only that event. Source ROOT lookup uses the metadata mapping
+`source_local_event = event_id - event_id_start`. The public files contain no
+`global_x/y/z` or `local_event` aliases. Saved notebook outputs are preserved and
+labelled historical; restart the kernel and Run All for the migrated collection.
+
 ## Higgs-portal pilot
 
-`higgs_portal_pilot.ipynb` now defaults to the published 100-event release at
-`/mnt/data2/data/collider_ml/homebrew/higgs_portal_v2_cells`.
+`higgs_portal_pilot.ipynb` now defaults to the compatible 200-event-per-setting collection at
+`/mnt/data2/data/collider_ml/homebrew/higgs_portal_v2_cells_compat1`.
 Change `PAIRED_ROOT` and `EVENT` in its configuration cell for another release/event;
 the original `exports/higgs-portal-pilot-run1-n1/paired` layout is also supported.
 No ACTS, Docker, ROOT inputs, PyTorch or additional input download is needed for
@@ -18,16 +27,16 @@ python -m jupyter lab notebooks/validation/higgs_portal_pilot.ipynb
 
 Pu0 is blue, pu200 green, with common bins and normalized overlays. These are
 **independent hard-scatter events**, not a controlled same-event pileup pair.
-Identical local event IDs do not imply event matching. The provenance table maps
+Identical event IDs across pu0 and pu200 do not imply event matching. The provenance table maps
 pu200 ROOT-entry/local-event IDs to merged HepMC signal IDs; multithreaded Geant4
 can reorder ROOT entries.
 
 Restart the kernel and Run All to replace saved outputs from earlier pilot runs.
-`EVENT=0` drives detailed feature histograms and cluster galleries.
-`PREVIEW_EVENTS=(0, 24, 99)` adds spatial views and measurements linked to displaced
+`EVENT=100` (the first run-4 event) drives detailed feature histograms and cluster galleries.
+`PREVIEW_EVENTS=(0, 100, 199)` adds spatial views and measurements linked to displaced
 generator-origin charged particles; there are no reconstructed tracks.
-`RUN_FULL_SHARD_SCAN=True` checks all 100 events in both settings by default.
-The scan reads each flat shard sequentially, retains one event plus input batches,
+`RUN_FULL_SHARD_SCAN=True` checks all 200 events in both settings by default.
+The scan reads each nested-hit / flat-cell shard sequentially, retains one event plus input batches,
 and only accumulates count/coverage tables and flagged-hit rows. Expect several
 minutes; progress is printed every ten events. It validates full-key joins,
 geometry/channel uniqueness, all contributor references, all frozen pixel codes,

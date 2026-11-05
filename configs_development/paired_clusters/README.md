@@ -25,6 +25,25 @@ outputs without `particles.root` cannot acquire ACTS perigee/vertex fields
 through `--resume-export`; use a new output directory for a fresh ACTS run,
 but reuse the downloaded EDM4hep files.
 
+## Compatible interface (current default)
+
+New outputs use `paired-cern-compatible-v1`: hits and particles have one row per
+**dataset-wide event ID**, and cells remain flat. Hits restore `x/y/z`, the
+volume/layer/surface columns, `true_x/y/z`, `time` and `detector` with the existing
+production converter's meanings and types. Every other hit feature is an aligned
+list, including `measurement_id` and nested contributor lists. Dataset/run context
+is Parquet metadata; packed `geometry_id` is additional, not a replacement.
+
+`--event-id-offset 0` is the first shard's range start. Nonzero runs require an
+explicit offset (for example `--run 4 --event-id-offset 100 --events 100`). Do not
+calculate IDs from run × requested event count. All three files use the same IDs;
+particle, parent and measurement IDs remain event-local. See
+[the complete interface and migration guide](../../docs/paired_schema_compatibility.md).
+
+The inherited ACTS/ODD versions and digitization configuration are unchanged.
+Existing flat files are read through the validation adapter; they are not
+silently rewritten. Migration of completed runs is separate from simulation.
+
 ## One-time setup
 
 Start with the two downloaded EDM4hep files at `data/pu0/edm4hep.root` and
@@ -159,10 +178,13 @@ for sample in ('pu0', 'pu200'):
     cells = pq.read_metadata(folder / 'cells.parquet').num_rows
     particles = pq.read_metadata(folder / 'particles.parquet').num_rows
     assert report['events'] == summary['events_per_sample'] == particles
-    assert (hits, cells) == (report['measurements'], report['cells'])
+    assert hits == particles == report['events']
+    assert cells == report['cells']
+    measurements = sum(len(row['measurement_id']) for row in pq.read_table(folder / 'hits.parquet', columns=['measurement_id']).to_pylist())
+    assert measurements == report['measurements']
     assert all(report['particle_feature_coverage'][name]['present']
                for name in ('perigee_d0', 'perigee_z0', 'vertex_primary'))
-    print(sample, 'events', particles, 'hits', hits, 'cells', cells,
+    print(sample, 'events', particles, 'hits', measurements, 'cells', cells,
           'multi-particle hits', report['multi_particle_measurements'],
           'null scalar labels', report['null_particle_labels'],
           'unresolved SimHit links', report['unresolved_simhit_links'],
@@ -184,8 +206,8 @@ cp "$CLUSTER_SCRATCH/output/paired-samples-features-n1/complete.json" \
 
 Each sample directory contains `hits.parquet`, `cells.parquet`,
 `particles.parquet`, `report.json`, and the ACTS ROOT/CSV outputs under
-`acts/`. Hits and cells join on `(campaign, dataset, version, run,
-local_event, measurement_id)`; hit `particle_id` joins to the particle ID
+`acts/`. Select/flatten one hit event, then join cells on `event_id` and
+`measurement_id` within the same dataset context; hit `particle_id` joins to the particle ID
 within the same event, and every ID in `particle_ids` does likewise. The
 `simhit_ids` list retains the ACTS association evidence. `particle_ids` can be
 partial when `particle_ids_complete` is false; never interpret a partial list
@@ -216,7 +238,7 @@ the same configured Docker environment would be:
 ```bash
 # Illustrative paths: these inputs must be supplied before running.
 python3 /workspace/scripts/postprocessing/run_paired_samples.py \
-  --dataset higgs_portal --version v1 --run 0 \
+  --dataset higgs_portal --version v1 --run 0 --event-id-offset 0 \
   --input-pu0 /data/higgs_portal/pu0/runs/0/edm4hep.root \
   --input-pu200 /data/higgs_portal/pu200/runs/0/edm4hep.root \
   --events 1 \
@@ -229,7 +251,7 @@ are not controlled here. The `higgs_portal` label is configurable, not a model
 definition or choice of lifetime/mass parameters.
 
 Use one invocation per source run, with a new output directory and matching
-pu0/pu200 input paths. For the next source run, change the two paths, `--run 1`,
+pu0/pu200 input paths. For the next source run, change the two paths, `--run 1 --event-id-offset <next-free-ID>`,
 and the output directory. The runner does not scan or concatenate multiple
 files. Callers must assign distinct run IDs within a campaign/dataset/version;
 the runner cannot enforce uniqueness across independent output directories.
@@ -239,13 +261,11 @@ ASCII letter or digit and otherwise contain only letters, digits, `_`, `-`, or
 `.`. The metadata is passed through conversion filenames and paths, final
 hit/cell keys, sample reports and the top-level `complete.json`.
 
-Event numbering deliberately stays **local to each input file**, from 0 to N-1.
-The converter uses an isolated temporary `runs/0` even when the source run ID is
-nonzero, avoiding its global-event offset convention. Final hit/cell keys carry
-the requested source `run`; measurement IDs still restart for each event.
-`particles.parquet` keeps the existing event-row schema with local `event_id`:
-join using the same sample/run context and local event, not `event_id` alone
-across concatenated source runs. Its particle IDs remain event-local as well.
+The converter still uses an isolated temporary `runs/0`; its original matching
+and input-local event numbering are unchanged. The final writer applies the
+explicit `--event-id-offset` to hits, cells and particles. It records the source
+mapping in Parquet metadata and reports. Dataset-wide IDs must not be passed
+directly to ACTS ROOT readers; use the recorded offset to recover the source entry.
 
 On `--resume-export`, repeat the same dataset, version, run, input paths and
 event count. Older conversion configs without `paired_run` are accepted only
@@ -365,7 +385,7 @@ for sample in ('pu0', 'pu200'):
         expected = quantizer.encode(batch.column('geometry_id').to_numpy(),
                                     batch.column('value').to_numpy())
         codes = batch.column('pixel_code')
-        assert np.array_equal(codes.is_valid().to_numpy(), expected != 0)
+        assert np.array_equal(codes.is_valid().to_numpy(zero_copy_only=False), expected != 0)
         assert np.array_equal(codes.fill_null(0).to_numpy(), expected)
     assert quantizer.report() == encoding
     print(sample, encoding['scheme'], 'pixel cells', encoding['pixel_cells'], 'OK')

@@ -9,7 +9,6 @@ import hashlib
 import json
 import math
 import re
-import shutil
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -27,6 +26,13 @@ except ModuleNotFoundError as error:
         raise
     from utils.pixel_quantization import (
         DEFAULT_SCHEME, METADATA_KEY, PRESETS_PATH, PixelQuantizer, add_quantization_argument)
+
+
+try:
+    from scripts.postprocessing.utils import paired_schema as compat
+except ModuleNotFoundError as error:
+    if error.name != "scripts": raise
+    from utils import paired_schema as compat
 
 
 KEY_FIELDS = ["campaign", "dataset", "version", "run", "local_event", "measurement_id"]
@@ -275,6 +281,8 @@ def export(args: argparse.Namespace) -> dict:
                  if particles_path else None)
     simhits_by_event = root_simhits(simhits_root_path) if simhits_root_path else None
 
+    if converted_hits is None or particles is None:
+        raise ValueError("Compatible export requires --converted-hits and --particles")
     root_events = root_measurements(args.measurements_root)
     measurement_paths = sorted(args.csv_dir.glob("event*-measurements.csv"))
     if not measurement_paths:
@@ -409,6 +417,7 @@ def export(args: argparse.Namespace) -> dict:
         raise ValueError(f"Digitization config lacks observed volumes: {sorted(observed_volumes - configured_volumes)}")
     if not hits or not cells:
         raise ValueError("Digitization produced no hits or no cells")
+    offset = compat.event_offset(getattr(args, "event_id_offset", None), args.run, len(seen_events))
 
     particle_feature_coverage = None
     particles_root = args.measurements_root.with_name("particles.root")
@@ -451,7 +460,7 @@ def export(args: argparse.Namespace) -> dict:
                                        Path(__file__).resolve().parent / "convert_digihits.py",
                                        Path(__file__).resolve().parent / "utils/parquet_utils.py",
                                        Path(__file__).resolve().parent / "utils/pixel_quantization.py",
-                                       PRESETS_PATH,
+                                       PRESETS_PATH, Path(compat.__file__).resolve(),
                                        Path(__file__).resolve().parents[1] / "simulation/digi_and_reco.py",
                                        Path(__file__).resolve().parents[2] /
                                        "configs_development/paired_clusters/digitization.yaml")},
@@ -461,13 +470,38 @@ def export(args: argparse.Namespace) -> dict:
                     *([simhits_root_path] if simhits_root_path else []),
                     *([particles_root] if particles_path and particles_root.is_file() else []))},
     }
+    context = {name: getattr(args, name) for name in compat.CONTEXT}
+    md = compat.metadata(context, offset, len(seen_events))
+    report.update(schema_version=compat.SCHEMA_VERSION, event_id_start=offset,
+                  event_id_stop_exclusive=offset + len(seen_events),
+                  source_event_mapping="source_local_event = event_id - event_id_start",
+                  hit_layout="one event row, aligned measurement lists")
+    # Finish alignment/schema validation before creating any output directory.
+    old_table = pa.Table.from_pylist(hits, schema=HIT_SCHEMA)
+    nested = []
+    maximum = 0.
+    for event in sorted(seen_events):
+        source = old_table.filter(pa.compute.equal(old_table["local_event"], event))
+        converted = pa.Table.from_pylist([converted_hits[event]])
+        table, delta = compat.hit_event(source, converted, event + offset, md)
+        nested.append(table)
+        maximum = max(maximum, delta)
+    report["maximum_xyz_roundtrip_difference_mm"] = maximum
     args.output.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(hits, schema=HIT_SCHEMA), args.output / "hits.parquet")
-    cell_schema = CELL_SCHEMA.with_metadata({
+    with pq.ParquetWriter(args.output / "hits.parquet", compat.HIT_SCHEMA.with_metadata(md)) as writer:
+        for table in nested:
+            writer.write_table(table, row_group_size=1)
+    cell_metadata = compat.metadata(context, offset, len(seen_events), {
         METADATA_KEY: json.dumps(report["cell_quantization"], sort_keys=True).encode()})
-    pq.write_table(pa.Table.from_pylist(cells, schema=cell_schema), args.output / "cells.parquet")
-    if particles_path:
-        shutil.copyfile(particles_path, args.output / "particles.parquet")
+    cell_table = pa.Table.from_pylist(cells, schema=CELL_SCHEMA)
+    pq.write_table(compat.rewrite_cells(cell_table, offset, args.version, cell_metadata), args.output / "cells.parquet")
+    with pq.ParquetWriter(args.output / "particles.parquet", compat.particle_schema(pq.read_schema(particles_path), md)) as writer:
+        for batch in pq.ParquetFile(particles_path).iter_batches(batch_size=1):
+            writer.write_table(compat.rewrite_particles(pa.Table.from_batches([batch]), offset, md), row_group_size=1)
+    report["source_converted_label_disagreement_examples"] = report["converted_label_disagreement_examples"]
+    report["converted_label_disagreement_examples"] = [
+        {**{k:v for k,v in e.items() if k != "local_event"}, "event_id": offset+e["local_event"]}
+        for e in (report["source_converted_label_disagreement_examples"] or [])]
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
@@ -477,6 +511,7 @@ def main() -> None:
     for name in ("campaign", "dataset", "version", "acts-revision", "odd-revision"):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--run", type=int, required=True)
+    parser.add_argument("--event-id-offset", type=int)
     for name in ("csv-dir", "measurements-root", "edm4hep", "digi-config", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--converted-hits", type=Path)

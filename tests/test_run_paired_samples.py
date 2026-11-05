@@ -55,7 +55,9 @@ class PairedPipelineTest(unittest.TestCase):
         report = {name: parts[parts.index(f"--{name}") + 1]
                   for name in ("campaign", "dataset", "version", "run")}
         report["run"] = int(report["run"])
-        report.update(events=self.args.events, local_events=list(range(self.args.events)))
+        offset = int(parts[parts.index("--event-id-offset")+1])
+        report.update(events=self.args.events, local_events=list(range(self.args.events)),
+                      event_id_start=offset,event_id_stop_exclusive=offset+self.args.events)
         report.update(overrides)
         (target / "report.json").write_text(json.dumps(report))
 
@@ -78,7 +80,7 @@ class PairedPipelineTest(unittest.TestCase):
                 "run_size": self.args.events, "chunk_size": self.args.events,
             }
             if not legacy:
-                config.update(paired_run=getattr(self.args, "run", 0),
+                config.update(event_id_offset=getattr(self.args,"event_id_offset",0), paired_run=getattr(self.args, "run", 0),
                               paired_digi_config_sha256=pipeline.hashlib.sha256(
                                   self.args.digi_config.read_bytes()).hexdigest())
             (self.args.output / f"_convert_{sample}.json").write_text(json.dumps(config))
@@ -135,6 +137,7 @@ class PairedPipelineTest(unittest.TestCase):
         self.args.events = 2
         self.args.pixel_quantization = "p99.5"
         self.args.dataset, self.args.version, self.args.run = "higgs_portal", "v2", 17
+        self.args.event_id_offset = 100
         self.prepare_resume()
         commands = []
 
@@ -156,6 +159,7 @@ class PairedPipelineTest(unittest.TestCase):
 
     def test_higgs_portal_paths_and_nonzero_run_keep_conversion_local(self):
         self.args.dataset, self.args.version, self.args.run = "higgs_portal", "v2", 17
+        self.args.event_id_offset = 100
         self.args.events = 2
         commands = []
 
@@ -219,6 +223,7 @@ class PairedPipelineTest(unittest.TestCase):
     def test_legacy_resume_is_run_zero_only(self):
         self.prepare_resume(legacy=True)
         self.args.run = 17
+        self.args.event_id_offset = 0
         with patch.object(pipeline, "revision", side_effect=[
                  pipeline.PINNED_ACTS_PREFIX, pipeline.PINNED_ODD_REVISION]), \
              patch.object(pipeline, "run_command") as command:

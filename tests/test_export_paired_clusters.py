@@ -24,6 +24,14 @@ SPEC.loader.exec_module(exporter)
 GEOMETRY_ID = (16 << 56) | (2 << 36) | (3 << 8)
 
 
+def read_test_hits(path):
+    # Existing truth tests inspect flattened measurements; on-disk schema is tested separately.
+    table = exporter.compat.read_event(path, pq.read_table(path, columns=['event_id'])['event_id'][0].as_py())
+    # Include all events for the two-event fixture.
+    table = pa.concat_tables([t for _, t in exporter.compat.iter_events(path)])
+    return table.rename_columns([{'event_id':'local_event','x':'global_x','y':'global_y','z':'global_z'}.get(k,k) for k in table.column_names]).to_pylist()
+
+
 def write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -74,6 +82,7 @@ class PairedClusterExportTest(unittest.TestCase):
                 "clus_size": np.array([2, 1], dtype=np.int32),
             }
         self.write_inputs()
+        self.write_converted()
 
     def write_inputs(self) -> None:
         write_csv(self.csv_dir / f"{self.prefix}measurements.csv",
@@ -89,6 +98,8 @@ class PairedClusterExportTest(unittest.TestCase):
             "event_id": [0], "x": [[1.0, 4.0]], "y": [[2.0, 5.0]],
             "z": [[3.0, 6.0]], "volume_id": [[16, 16]],
             "layer_id": [[2, 2]], "surface_id": [[3, 3]],
+            "true_x": [[1., 4.]], "true_y": [[2., 5.]], "true_z": [[3., 6.]],
+            "time": [[0.1, 0.2]], "detector": [[1, 255]],
             "particle_id": [list(labels)],
         }), self.args.converted_hits)
         pq.write_table(pa.table({"event_id": [0], "particle_id": [[4, 5, 6]]}),
@@ -96,13 +107,13 @@ class PairedClusterExportTest(unittest.TestCase):
 
     def test_preserves_multiple_contributors_and_cells(self) -> None:
         report = exporter.export(self.args)
-        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        hits = read_test_hits(self.args.output / "hits.parquet")
         cells = pq.read_table(self.args.output / "cells.parquet").to_pylist()
         self.assertEqual([hit["simhit_ids"] for hit in hits], [[7, 8], [9]])
         self.assertEqual([cell["channel0"] for cell in cells], [10, 11, 21])
         self.assertEqual(report["multi_contributor_measurements"], 1)
         self.assertEqual((report["events"], report["measurements"], report["cells"]), (1, 2, 3))
-        self.assertEqual(len(report["inputs"]), 3)
+        self.assertEqual(len(report["inputs"]), 5)
 
     def test_rejects_orphan_cell(self) -> None:
         self.cells[0]["measurement_id"] = 99
@@ -150,12 +161,12 @@ class PairedClusterExportTest(unittest.TestCase):
             self.assertEqual(encoding["scheme"], scheme)
             self.assertEqual(encoding["pixel_cells"], 2)
             self.assertEqual(encoding["unchanged_nonpixel_cells"], 1)
-            hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+            hits = read_test_hits(self.args.output / "hits.parquet")
             if reference_hits is None:
                 reference_hits = hits
             self.assertEqual(hits, reference_hits)
-            self.assertEqual((self.args.output / "particles.parquet").read_bytes(),
-                             self.args.particles.read_bytes())
+            self.assertEqual(pq.read_table(self.args.output / "particles.parquet").to_pydict(),
+                             pq.read_table(self.args.particles).to_pydict())
 
     def test_default_codes_and_config_gate_before_output(self) -> None:
         del self.args.pixel_quantization
@@ -177,13 +188,13 @@ class PairedClusterExportTest(unittest.TestCase):
     def test_adds_single_labels_and_copies_particles(self) -> None:
         self.write_converted(labels=(4, None))
         report = exporter.export(self.args)
-        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        hits = read_test_hits(self.args.output / "hits.parquet")
         self.assertEqual([hit["particle_id"] for hit in hits], [4, None])
         self.assertEqual([hit["simhit_ids"] for hit in hits], [[7, 8], [9]])
         self.assertEqual(report["null_particle_labels"], 1)
         self.assertEqual(report["particles"], 3)
-        self.assertEqual((self.args.output / "particles.parquet").read_bytes(),
-                         self.args.particles.read_bytes())
+        self.assertEqual(pq.read_table(self.args.output / "particles.parquet").to_pydict(),
+                         pq.read_table(self.args.particles).to_pydict())
 
     def test_rejects_shuffled_converted_hit(self) -> None:
         self.write_converted()
@@ -200,16 +211,17 @@ class PairedClusterExportTest(unittest.TestCase):
         keys = []
         for run in (17, 18):
             self.args.run = run
+            self.args.event_id_offset = (run - 17) * 100
             self.args.output = self.base / f"run{run}"
             report = exporter.export(self.args)
             self.assertEqual((report["dataset"], report["version"], report["run"]),
                              ("higgs_portal", "v2", run))
-            hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+            hits = read_test_hits(self.args.output / "hits.parquet")
             cells = pq.read_table(self.args.output / "cells.parquet").to_pylist()
-            self.assertEqual([hit["local_event"] for hit in hits], [0, 0])
+            self.assertEqual([hit["local_event"] for hit in hits], [(run - 17) * 100] * 2)
             self.assertEqual([hit["measurement_id"] for hit in hits], [0, 1])
             self.assertTrue(all(cell["run"] == run for cell in cells))
-            self.assertEqual(pq.read_table(self.args.output / "particles.parquet")["event_id"].to_pylist(), [0])
+            self.assertEqual(pq.read_table(self.args.output / "particles.parquet")["event_id"].to_pylist(), [(run-17)*100])
             keys.append({tuple(hit[name] for name in exporter.KEY_FIELDS) for hit in hits})
         self.assertTrue(keys[0].isdisjoint(keys[1]))
 
@@ -253,7 +265,7 @@ class PairedClusterExportTest(unittest.TestCase):
         pq.write_table(pa.table(hits), self.args.converted_hits)
         pq.write_table(pa.table(particles), self.args.particles)
         report = exporter.export(self.args)
-        output_hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        output_hits = read_test_hits(self.args.output / "hits.parquet")
         self.assertEqual(report["events"], 2)
         self.assertEqual((report["measurements"], report["cells"]), (4, 6))
         self.assertEqual([(hit["local_event"], hit["measurement_id"]) for hit in output_hits],
@@ -281,7 +293,7 @@ class PairedClusterExportTest(unittest.TestCase):
         edm_hits = [(11, 21, 31, 4), (12, 22, 32, 5), (13, 23, 33, 5)]
         with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits):
             report = exporter.export(self.args)
-        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        hits = read_test_hits(self.args.output / "hits.parquet")
         self.assertEqual([hit["particle_ids"] for hit in hits], [[4, 5], [5]])
         self.assertEqual([hit["particle_id"] for hit in hits], [None, 5])
         self.assertEqual([hit["particle_ids_complete"] for hit in hits], [True, True])
@@ -290,7 +302,7 @@ class PairedClusterExportTest(unittest.TestCase):
 
         with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits[1:]):
             report = exporter.export(self.args)
-        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        hits = read_test_hits(self.args.output / "hits.parquet")
         self.assertEqual([hit["particle_ids"] for hit in hits], [[5], [5]])
         self.assertEqual([hit["particle_id"] for hit in hits], [None, 5])
         self.assertEqual([hit["particle_ids_complete"] for hit in hits], [False, True])
@@ -301,7 +313,7 @@ class PairedClusterExportTest(unittest.TestCase):
         self.write_converted(labels=(None, 4))
         with patch.object(exporter, "edm_tracker_hits", return_value=edm_hits):
             report = exporter.export(self.args)
-        hits = pq.read_table(self.args.output / "hits.parquet").to_pylist()
+        hits = read_test_hits(self.args.output / "hits.parquet")
         self.assertEqual(hits[1]["converted_particle_id"], 4)
         self.assertEqual(hits[1]["particle_id"], 5)
         self.assertEqual(report["converted_label_disagreements"], 1)

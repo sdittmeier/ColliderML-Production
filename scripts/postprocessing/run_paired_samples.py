@@ -24,6 +24,12 @@ except ModuleNotFoundError as error:
     from utils.pixel_quantization import DEFAULT_SCHEME, PixelQuantizer, add_quantization_argument
 
 
+try:
+    from scripts.postprocessing.utils import paired_schema as compat
+except ModuleNotFoundError as error:
+    if error.name != "scripts": raise
+    from utils import paired_schema as compat
+
 REPO = Path(__file__).resolve().parents[2]
 PAIRED_CONFIG = REPO / "configs_development/paired_clusters/digitization.yaml"
 DIGI_CONFIG = REPO / "scripts/simulation/odd-full-geo-digi-config.json"
@@ -85,6 +91,7 @@ def run(args: argparse.Namespace) -> dict:
             raise ValueError(f"--{name} must be a nonempty label without spaces or path separators")
     if not isinstance(run_id, int) or isinstance(run_id, bool) or not 0 <= run_id < 2**32:
         raise ValueError("--run must be a nonnegative uint32 identifier")
+    offset = compat.event_offset(getattr(args, "event_id_offset", None), run_id, args.events)
     output = args.output.resolve()
     resume_export = getattr(args, "resume_export", False)
     if output.exists() and not resume_export:
@@ -133,6 +140,7 @@ def run(args: argparse.Namespace) -> dict:
                     or config.get("campaign") != campaign
                     or config.get("dataset") != dataset or config.get("version") != version
                     or config.get("paired_run", 0) != run_id
+                    or config.get("event_id_offset", 0) != offset
                     or config.get("paired_digi_config_sha256", digi_sha256) != digi_sha256
                     or (conversion_input / "edm4hep.root").resolve() != inputs[sample]
                     or (conversion_input / "measurements.root").resolve() != acts_dir / "measurements.root"
@@ -164,7 +172,7 @@ def run(args: argparse.Namespace) -> dict:
             (conversion_input / "particles.root").symlink_to(acts_dir / "particles.root")
             config = {
                 "campaign": campaign, "dataset": dataset, "version": version,
-                "paired_run": run_id, "paired_digi_config_sha256": digi_sha256,
+                "paired_run": run_id, "paired_digi_config_sha256": digi_sha256, "event_id_offset": offset,
                 "common": {"output_base_dir": str(conversion_output)},
                 "input_base_dir": str(conversion_input.parents[1]),
                 "h5_output_dir": str(conversion_output),
@@ -184,7 +192,7 @@ def run(args: argparse.Namespace) -> dict:
         validate_particle_features(particles)
         run_command(sys.executable, str(REPO / "scripts/postprocessing/export_paired_clusters.py"),
                     "--campaign", campaign, "--dataset", dataset, "--version", version,
-                    "--run", str(run_id), "--acts-revision", acts_revision, "--odd-revision", odd_revision,
+                    "--run", str(run_id), "--event-id-offset", str(offset), "--acts-revision", acts_revision, "--odd-revision", odd_revision,
                     "--edm4hep", str(inputs[sample]), "--digi-config", str(args.digi_config),
                     "--measurements-root", str(acts_dir / "measurements.root"),
                     "--simhits-root", str(acts_dir / "simhits.root"),
@@ -198,10 +206,13 @@ def run(args: argparse.Namespace) -> dict:
         if report["events"] != args.events or report["local_events"] != list(range(args.events)):
             raise ValueError(f"{sample}: exported events {report['local_events']}, "
                              f"expected {list(range(args.events))}")
+        if report.get("event_id_start") != offset or report.get("event_id_stop_exclusive") != offset + args.events:
+            raise ValueError("Exported global event range does not match requested offset")
         reports[sample] = report
 
     summary = {"dataset": dataset, "version": version, "run": run_id,
-               "events_per_sample": args.events, "pixel_quantization": pixel_quantization,
+               "events_per_sample": args.events, "schema_version": compat.SCHEMA_VERSION,
+               "event_id_start": offset, "event_id_stop_exclusive": offset + args.events, "pixel_quantization": pixel_quantization,
                "samples": reports}
     (output / "complete.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
@@ -212,7 +223,8 @@ def main() -> None:
     parser.add_argument("--dataset", default="ttbar")
     parser.add_argument("--version", default="v1")
     parser.add_argument("--run", type=int, default=0,
-                        help="Source run ID in exported keys; event indices stay local to this input")
+                        help="Source run ID; public event IDs use the explicit --event-id-offset")
+    parser.add_argument("--event-id-offset", type=int, help="Global event range start; required for nonzero runs")
     parser.add_argument("--input-pu0", type=Path,
                         help="Hard-scatter EDM4hep file (ttbar default: /data/pu0/edm4hep.root)")
     parser.add_argument("--input-pu200", type=Path,

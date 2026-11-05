@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 import uproot
 
 from . import paired_vs_published as paired
+from scripts.postprocessing.utils import paired_schema as compat
 
 
 @dataclass
@@ -30,27 +31,40 @@ class Sample:
     analysis: object
 
 
-def sample_files(root, sample):
-    """Resolve the original paired layout or the published homebrew layout."""
-    root = Path(root)
-    if (root / sample / "report.json").is_file():
-        return ({kind: root / sample / f"{kind}.parquet" for kind in ("hits", "cells", "particles")},
-                root / sample / "report.json")
-    paths = {}
-    for kind in ("hits", "cells", "particles"):
-        name = f"higgs_portal_{sample}_{kind}"
-        files = sorted((root / name / "data" / name).glob("*.parquet"))
-        if len(files) != 1:
-            raise ValueError(f"Expected one {name} shard under {root}, found {len(files)}")
-        paths[kind] = files[0]
-    reports = sorted(root.glob(f"provenance/run-*/{sample}_report.json"))
-    if len(reports) != 1:
-        raise ValueError("Select a release with exactly one run provenance directory")
-    return paths, reports[0]
+def sample_files(root, sample, event=None, run=None):
+    return compat.resolve_sample(root, sample, event, run)
 
 
 def production_evidence(root):
     root = Path(root)
+    if (root / 'manifest.json').is_file() and (root / 'migration_validation.json').is_file():
+        m=json.loads((root/'manifest.json').read_text())
+        receipt=json.loads((root/'migration_validation.json').read_text())
+        if not receipt['passed']: raise ValueError('Migration validation did not pass')
+        pilots=[]; simulations=[]
+        for shard in m['shards']:
+            folder=root/shard['provenance']/'source'
+            p=json.loads((folder/'pilot.json').read_text())
+            sim=json.loads((folder/'simulation_validation.json').read_text())
+            if not p['complete'] or not p['simulation_validated'] or not sim['passed']:
+                raise ValueError('Original production validation failed')
+            pilots.append(p); simulations.append(sim)
+        pilot={**pilots[0], 'version':m['version'], 'events':m['events_per_sample'],
+               'run':[s['run'] for s in m['shards']],
+               'selected_signal_events':[dict(run=s['run'], **e) for s,p in zip(m['shards'],pilots) for e in p['selected_signal_events']]}
+        simulation={**simulations[0], 'events':m['events_per_sample'],
+                    'llps_checked':sum(s['llps_checked'] for s in simulations),
+                    'source_runs':[s['run'] for s in m['shards']],
+                    'root_to_hepmc':[dict(run=s['run'],event_id=s['event_id_start']+e['root_entry'],**e)
+                        for s,sim in zip(m['shards'],simulations) for e in sim['root_to_hepmc']]}
+        for key,value in simulations[0].items():
+            if key.startswith('maximum_') and isinstance(value,(int,float)):
+                simulation[key]=max(s.get(key,0) for s in simulations)
+            elif key.endswith(('_checked','_count','_matches')) and isinstance(value,int) and not isinstance(value,bool):
+                simulation[key]=sum(s.get(key,0) for s in simulations)
+        simulation['descendant_matching_failures']=[dict(run=shard['run'],**f) for shard,sim in zip(m['shards'],simulations) for f in sim.get('descendant_matching_failures',[])]
+        simulation['decay_boost_matches']=[dict(run=s['run'],**e) for s,sim in zip(m['shards'],simulations) for e in sim.get('decay_boost_matches',[])]
+        return pilot,dict(events_per_sample=m['events_per_sample'],samples=m['samples'],schema_version=m['schema_version']),simulation
     if (root / "complete.json").is_file():
         parent, complete = root.parent, root / "complete.json"
     else:
@@ -73,16 +87,13 @@ def production_evidence(root):
 
 
 def file_hashes(paired_root):
-    result = {}
-    for sample in paired.PILEUP_COLORS:
-        paths, _ = sample_files(paired_root, sample)
-        for kind, path in paths.items():
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                    digest.update(block)
-            result[str(path)] = digest.hexdigest()
-    return result
+    root = Path(paired_root)
+    if (root / 'manifest.json').is_file():
+        m = json.loads((root / 'manifest.json').read_text())
+        paths = [root / f['path'] for s in m['shards'] for tables in s['files'].values() for f in tables.values()]
+    else:
+        paths = [p for sample in paired.PILEUP_COLORS for p in sample_files(root, sample)[0].values()]
+    return {str(p): compat.sha256(p) for p in paths}
 
 
 def particle_frame(row):
@@ -118,10 +129,10 @@ def particle_event(path, event):
 def load_samples(paired_root, event=0, include_cells=True):
     result = {}
     for name in paired.PILEUP_COLORS:
-        paths, report_path = sample_files(paired_root, name)
+        paths, report_path = sample_files(paired_root, name, event)
         report = json.loads(report_path.read_text())
         for kind, expected in (("hits", "measurements"), ("cells", "cells"), ("particles", "events")):
-            if pq.read_metadata(paths[kind]).num_rows != report[expected]:
+            if pq.read_metadata(paths[kind]).num_rows != (report["events"] if kind == "hits" and compat.SCHEMA_KEY in (pq.read_schema(paths[kind]).metadata or {}) else report[expected]):
                 raise ValueError(f"{name}: {kind} row count disagrees with report.json")
         hits = paired._flat_event(paths["hits"], event)
         cells = paired._flat_event(paths["cells"], event) if include_cells else None
@@ -171,7 +182,7 @@ def integrity(samples):
                         multi_particle_measurements=multi, unresolved_simhit_links=unresolved,
                         incomplete_truth_measurements=incomplete,
                         converted_label_disagreements=disagreements)
-        if data.report["events"] == 1:
+        if data.report["events"] == 1 and not data.report.get("subset_trial", False):
             for key, value in measured.items():
                 if data.report[key] != value:
                     raise ValueError(f"{name}: {key} differs from report ({value} vs {data.report[key]})")
@@ -201,7 +212,7 @@ def quantization(samples):
             raise ValueError(f"{name}: wrong pixel codes or encoded strip cells")
         count15 = int((codes == 15).sum())
         clipped = int((values >= encoded["code15_bin_end"]).sum())
-        if data.report["events"] == 1:
+        if data.report["events"] == 1 and not data.report.get("subset_trial", False):
             if count15 != encoded["code15_cells"] or clipped != encoded["genuinely_clipped_cells"]:
                 raise ValueError(f"{name}: encoding counts differ from report")
         rows.append(dict(sample=name, scheme=encoded["scheme"], pixel_cells=len(codes),
@@ -291,10 +302,10 @@ def plot_spatial(samples, limit=15000, seed=7, cohort="generator_charged_with_hi
         style = dict(s=9, facecolors="none", edgecolors=color, linewidths=.6, alpha=.65) if name == "pu0" else dict(s=3, color=color, alpha=.3)
         axes[0, 0].scatter(subset.vx, subset.vy, label=name, **style)
         axes[0, 1].scatter(subset.vz, subset.production_r, label=name, **style)
-        hits = data.hits.select(["global_x", "global_y", "global_z"]).to_pandas()
+        hits = data.hits.select(["x", "y", "z"]).to_pandas()
         subset = hits.sample(min(limit, len(hits)), random_state=seed)
-        axes[1, 0].scatter(subset.global_x, subset.global_y, label=name, **style)
-        axes[1, 1].scatter(subset.global_z, np.hypot(subset.global_x, subset.global_y), label=name, **style)
+        axes[1, 0].scatter(subset.x, subset.y, label=name, **style)
+        axes[1, 1].scatter(subset.z, np.hypot(subset.x, subset.y), label=name, **style)
     settings = [("Particle production x-y", "vx [mm]", "vy [mm]"),
                 ("Particle production r-z", "vz [mm]", "r [mm]"),
                 ("Measurements x-y", "x [mm]", "y [mm]"),
@@ -315,11 +326,11 @@ def plot_hits(samples):
         frame["volume_id"] = geom >> 56
         frame["layer_id"] = (geom >> 36) & 0xfff
         frame["surface_id"] = (geom >> 8) & 0xfffff
-        frame["radius"] = np.hypot(frame.global_x, frame.global_y)
+        frame["radius"] = np.hypot(frame.x, frame.y)
         frame["known_particles"] = frame.particle_ids.map(len)
         frame["simhit_count"] = frame.simhit_ids.map(len)
         frames[name] = frame
-    overlay_grid(frames, ["global_x", "global_y", "global_z", "radius", "local0", "local1",
+    overlay_grid(frames, ["x", "y", "z", "radius", "local0", "local1",
                           "volume_id", "layer_id", "surface_id", "known_particles", "simhit_count"],
                  "Measurements: native positions in mm; normalized overlays")
 
@@ -538,25 +549,7 @@ def validate_cell_links(hits, cells):
 
 
 def iter_flat_events(path, batch_size=65536):
-    """Read each flat shard once, retaining at most one event plus one batch."""
-    current, pieces = None, []
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size):
-        table = pa.Table.from_batches([batch])
-        ids = table["local_event"].to_numpy()
-        if len(ids) == 0:
-            continue
-        if np.any(ids[1:] < ids[:-1]) or (current is not None and ids[0] < current):
-            raise ValueError("Flat shard must be ordered by local_event")
-        boundaries = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1, len(ids)]
-        for start, stop in zip(boundaries[:-1], boundaries[1:]):
-            event = int(ids[start])
-            if current is not None and event != current:
-                yield current, pa.concat_tables(pieces)
-                pieces = []
-            current = event
-            pieces.append(table.slice(int(start), int(stop - start)))
-    if current is not None:
-        yield current, pa.concat_tables(pieces)
+    yield from compat.iter_events(path)
 
 
 def perigee_coverage(particles, sample, event):
@@ -585,11 +578,16 @@ def truth_review(sample, limit=None):
     return result if limit is None else result.head(limit)
 
 
-def scan_campaign(root, progress=True):
+def scan_campaign(root, progress=True, _paths=None):
+    root = Path(root)
+    if (root / "manifest.json").is_file() and _paths is None:
+        manifest = json.loads((root / "manifest.json").read_text())
+        scans = [scan_campaign(root, progress, {name: sample_files(root, name, run=s["run"]) for name in paired.PILEUP_COLORS}) for s in manifest["shards"]]
+        return {k: pd.concat([scan[k] for scan in scans], ignore_index=True) for k in scans[0]}
     """All events, all cells; sequential scans, no collection of large event frames."""
     counts, codes, coverage_rows, issues = [], [], [], []
     for name in paired.PILEUP_COLORS:
-        paths, report_path = sample_files(root, name)
+        paths, report_path = _paths[name] if _paths else sample_files(root, name)
         report = json.loads(report_path.read_text())
         particle_rows = pq.ParquetFile(paths["particles"]).iter_batches(batch_size=1)
         seen = []
@@ -612,7 +610,7 @@ def scan_campaign(root, progress=True):
             if progress and len(seen) % 10 == 0:
                 print(f"{name}: checked {len(seen)}/{report['events']} complete events", flush=True)
             del sample, hit_event, cell_event, row, particle_batch
-        if seen != list(range(report["events"])):
+        if seen != list(range(report.get("event_id_start", 0), report.get("event_id_start", 0) + report["events"])):
             raise ValueError("Shard does not contain exactly local events 0..N-1")
         measured = pd.DataFrame([r for r in counts if r["sample"] == name])
         for key in ("measurements", "cells", "particles", "simhit_links", "null_particle_labels",
@@ -663,8 +661,8 @@ def plot_linked_hits(samples, limit=15000, seed=7):
         hits = hits[[bool(ids.intersection(p)) for p in hits.particle_ids]]
         view = hits.sample(min(limit, len(hits)), random_state=seed)
         color = paired.PILEUP_COLORS[name]
-        axes[0, column].scatter(view.global_x, view.global_y, s=3, color=color, alpha=.35)
-        axes[1, column].scatter(view.global_z, np.hypot(view.global_x, view.global_y), s=3, color=color, alpha=.35)
+        axes[0, column].scatter(view.x, view.y, s=3, color=color, alpha=.35)
+        axes[1, column].scatter(view.z, np.hypot(view.x, view.y), s=3, color=color, alpha=.35)
         axes[0, column].set(title=f"{name}: hits linked to displaced generator particles", xlabel="x [mm]", ylabel="y [mm]")
         axes[1, column].set(xlabel="z [mm]", ylabel="r [mm]")
     plt.show()

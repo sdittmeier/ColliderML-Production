@@ -13,6 +13,23 @@ mentioned in the production log is not publicly retrievable. Our small port is
 therefore based on the published settings and the exact DD4hep API/source, and
 must pass the runtime gates; it is not claimed to be a bitwise upstream reproduction.
 
+## Current export interface
+
+New productions write `v2_cells_compat1` using the nested CERN-compatible hit
+schema and dataset-wide event IDs. Source physics remains Higgs-portal v2. Existing
+simulation, perigee recovery and P99.9 encoding are unchanged. For a subsequent
+shard, supply **both** `--signal-start` (input selection) and `--event-id-offset`
+(output identity); these are separate concepts.
+
+For the next 100-event shard after migrated runs 3/4, choose an unused run ID and
+use `--signal-start 200 --event-id-offset 200`. Inspect the live pileup registry
+before selecting the run. Old completed productions must use the standalone
+Parquet migration, not a resume stage with modified source checksums.
+
+See [schema, migration and validation](../../docs/paired_schema_compatibility.md).
+The historical commands below describe earlier runs; add the explicit event-ID
+offset when invoking the current launcher with a nonzero run.
+
 ## From a fresh host bash shell
 
 The previously built `colliderml-acts:7cba36b17` Docker image and existing cache
@@ -195,8 +212,11 @@ bash scripts/cli/run_higgs_portal_pilot.sh \
   --output /output/higgs-portal-pilot-run1-n16
 ```
 
-The pu0 validation reference intentionally overlaps the earlier pilot: these are
-tests, not disjoint dataset shards to concatenate. The background is fresh.
+For new runs, `--signal-start` advances both the selected signal HepMC entries
+and the pu0 ROOT-entry range. Historical runs made before the `pu0_selection`
+manifest field was added always used the first requested pu0 ROOT entries,
+regardless of `--signal-start`; inspect their provenance before concatenating
+pilot outputs with production shards. The background is fresh.
 Before a 1,000-event campaign, review timing/RAM/disk use, require the displaced
 gate to be exercised, and plan production sharding/source-event bookkeeping.
 
@@ -230,10 +250,10 @@ For the existing 100-event run, from a host shell in the same tmux/Slurm session
 cd /home/atlas/dittmeier/git/cluster_extraction/ColliderML-Production
 
 bash scripts/cli/run_higgs_portal_pilot.sh \
-  --events 100 --threads 25 --run 3 --signal-start 0 \
+  --events 100 --threads 25 --run 3 --signal-start 0 --event-id-offset 0 \
   --stage validate --output /output/higgs-portal-run3-n100 && \
 bash scripts/cli/run_higgs_portal_pilot.sh \
-  --events 100 --threads 25 --run 3 --signal-start 0 \
+  --events 100 --threads 25 --run 3 --signal-start 0 --event-id-offset 0 \
   --stage export --output /output/higgs-portal-run3-n100
 ```
 
@@ -247,3 +267,58 @@ Geant4. No image rebuild is required. The `25` thread argument identifies the
 saved simulation settings; validation/export remain serial. Reading the full
 merged HepMC reference can take tens of minutes; progress is printed every ten
 events. Paired products are written under the existing run's `paired/` directory.
+
+
+## Next disjoint 100-event shard, using persistent storage
+
+Run 3 contains source entries 0–99. Use run 4 and source entries 100–199 next.
+The two source files remain independent event selections: identical positions in
+pu0 ROOT and signal HepMC do not establish event-by-event pairing.
+
+For a nonzero `--signal-start`, preparation writes a selected pu0 PODIO file at
+`inputs/pu0/edm4hep.root`, used consistently by ACTS, the production converter,
+and the paired exporter. `pu0_selection.json` and `pilot.json` record its source
+entry range, checksum and verification. All physical fields and metadata frames
+are checked exactly against the original entries. Current EDM4hep schema evolution
+removes the two obsolete MCParticle `colorFlow` fields and changes EventHeader
+`eventNumber`/`runNumber` storage from signed 32-bit to unsigned 64/32-bit. Only
+those documented transformations are permitted and recorded; the invalid run
+sentinel -1 becomes unsigned 4294967295. Event numbers are not renumbered.
+The original downloaded file remains untouched. Any other schema/value change
+fails before Geant4 starts.
+
+From a fresh login shell inside tmux, request a **new** Slurm allocation; an old
+allocation may have too little remaining time or RAM:
+
+```bash
+srun --partition=debug --ntasks=1 --cpus-per-task=25 --mem=192G \
+  --time=08:00:00 --pty bash
+```
+
+Inside that allocation:
+
+```bash
+cd /home/atlas/dittmeier/git/cluster_extraction/ColliderML-Production
+export CLUSTER_SCRATCH=/mnt/data2/data/collider_ml/production
+
+test -s "$CLUSTER_SCRATCH/cache/higgs-portal-pilot/pileup-seeds.json"
+test ! -e "$CLUSTER_SCRATCH/output/higgs-portal-run4-n100"
+
+bash scripts/cli/run_higgs_portal_pilot.sh \
+  --events 100 --threads 25 --run 4 --signal-start 100 --event-id-offset 100 \
+  --output /output/higgs-portal-run4-n100
+```
+
+The launcher applies `SLURM_CPUS_PER_TASK` as Docker's CPU quota and
+`SLURM_MEM_PER_NODE` (MiB) as its memory limit, since Docker otherwise runs outside
+the Slurm task cgroup. The preceding run used approximately 130 GiB during Geant4;
+192 GiB provides headroom. No image rebuild is needed. Allow roughly 4–6 hours;
+export remains serial after the multithreaded Geant4 step.
+
+All outputs stay under
+`/mnt/data2/data/collider_ml/production/output/higgs-portal-run4-n100/`.
+The persistent registry reserves a fresh run-4 pileup seed; the namespace must
+remain unchanged. No Geant4 event or pileup generation is started by the unit and
+input-selection smoke tests. After completion, point `PAIRED_ROOT` in the
+validation notebook at this run's `paired` directory. Publishing additional
+homebrew shards is a separate step; do not overwrite the existing shard.

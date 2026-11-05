@@ -25,7 +25,7 @@ class HiggsPortalNotebookTest(unittest.TestCase):
 
     def test_integrity_detects_missing_particle_and_duplicate_measurement(self):
         key = dict(campaign="hard_scatter", dataset="higgs_portal", version="test", run=1,
-                   local_event=0, measurement_id=0)
+                   event_id=0, measurement_id=0)
         hits = pa.Table.from_pylist([{**key, "particle_id": 10, "converted_particle_id": 10,
                                      "particle_ids": [10], "simhit_ids": [7],
                                      "unresolved_simhit_ids": [], "particle_ids_complete": True}])
@@ -112,7 +112,7 @@ class HiggsPortalNotebookTest(unittest.TestCase):
         hits, cells, particles = [], [], []
         for event in range(2):
             key = dict(campaign="hard_scatter" if sample == "pu0" else "full_pileup",
-                       dataset="higgs_portal", version="test", run=3, local_event=event, measurement_id=0)
+                       dataset="higgs_portal", version="test", run=3, event_id=event, measurement_id=0)
             geometry = 16 << 56
             hits.append(dict(**key, geometry_id=geometry, particle_id=10, converted_particle_id=10,
                              particle_ids=[10], simhit_ids=[7], unresolved_simhit_ids=[], particle_ids_complete=True))
@@ -160,7 +160,7 @@ class HiggsPortalNotebookTest(unittest.TestCase):
             cells = pq.read_table(folder / "cells.parquet")
             validation.validate_cell_links(hits, cells)
             broken = cells.to_pylist()
-            broken[0]["local_event"] = 9
+            broken[0]["event_id"] = 9
             with self.assertRaisesRegex(ValueError, "Orphan cells"):
                 validation.validate_cell_links(hits, pa.Table.from_pylist(broken))
             broken = cells.to_pylist()
@@ -176,7 +176,7 @@ class HiggsPortalNotebookTest(unittest.TestCase):
             hits = pq.read_table(folder / "hits.parquet").slice(0, 1)
             cells = pq.read_table(folder / "cells.parquet").slice(0, 1)
             validation.validate_cell_links(hits, cells)
-            for field in ("campaign", "dataset", "version", "run", "local_event"):
+            for field in ("campaign", "dataset", "version", "run", "event_id"):
                 row = cells.to_pylist()[0]
                 row[field] = "wrong" if isinstance(row[field], str) else row[field] + 1
                 with self.subTest(field=field), self.assertRaisesRegex(ValueError, "full event context"):
@@ -196,7 +196,7 @@ class HiggsPortalNotebookTest(unittest.TestCase):
     def test_flat_event_iterator_rejects_out_of_order_events(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "unordered.parquet"
-            pq.write_table(pa.table(dict(local_event=[1, 0], value=[.1, .2])), path)
+            pq.write_table(pa.table(dict(event_id=[1, 0], value=[.1, .2])), path)
             with self.assertRaisesRegex(ValueError, "ordered"):
                 list(validation.iter_flat_events(path))
 

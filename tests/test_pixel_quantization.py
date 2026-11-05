@@ -36,7 +36,7 @@ class PixelQuantizationTest(unittest.TestCase):
                 (1, 0, [.02, .02], True, [2]),
                 (0, 1, [.015, .025, .06], False, [3, 4])):
             key = dict(campaign="test", dataset="ttbar", version="v1", run=run,
-                       local_event=event, measurement_id=mid)
+                       event_id=event, measurement_id=mid)
             hits.append(dict(**key, geometry_id=16 << 56, particle_ids=particle_ids,
                              particle_ids_complete=complete, simhit_ids=[mid]))
             for i, value in enumerate(values):
@@ -305,7 +305,7 @@ class PixelQuantizationTest(unittest.TestCase):
                 # Include a strip in the same event and pixels in a different event.
                 cells = analysis.cells[[*p.MEASUREMENT_KEY, "geometry_id", "channel0", "channel1", "value"]].to_dict("records")
                 cells += [{**cells[0], "geometry_id": 23 << 56, "value": 10.},
-                          {**cells[0], "local_event": 1, "value": 20.}]
+                          {**cells[0], "event_id": 1, "value": 20.}]
                 pq.write_table(pa.Table.from_pylist(cells), folder / "cells.parquet")
                 for name in ("hits", "particles"):
                     pq.write_table(pa.table({"marker": [1]}), folder / f"{name}.parquet")

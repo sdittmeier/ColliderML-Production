@@ -30,7 +30,16 @@ fi
 printf '%s\n' "Host outputs: $CLUSTER_SCRATCH/output" \
     "Geant4 datasets are required now; they will be downloaded/cached if missing."
 
-docker run --rm -i --entrypoint /bin/bash \
+# Docker does not inherit the Slurm cgroup; apply the allocation's limits explicitly.
+docker_limits=()
+if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
+    docker_limits+=(--cpus "$SLURM_CPUS_PER_TASK")
+fi
+if [[ "${SLURM_MEM_PER_NODE:-}" =~ ^[1-9][0-9]*$ ]]; then
+    docker_limits+=(--memory "${SLURM_MEM_PER_NODE}m")
+fi
+
+docker run "${docker_limits[@]}" --rm -i --entrypoint /bin/bash \
     -v "$REPO":/workspace:ro \
     -v "$CLUSTER_ROOT/data":/data:ro \
     -v "$CLUSTER_SCRATCH/cache":/cache \
@@ -53,6 +62,7 @@ docker run --rm -i --entrypoint /bin/bash \
         python3 -c "import acts.examples.pythia8, acts.examples.hepmc3, DDSim, pyhepmc, pyedm4hep, pyarrow, uproot, yaml; print(\"Pilot imports OK\")"
         python3 -m unittest tests.test_higgs_portal_pilot tests.test_ddsim_llp_settings \
             tests.test_recover_duplicate_events tests.test_run_paired_samples \
-            tests.test_export_paired_clusters tests.test_production_pixel_quantization
+            tests.test_export_paired_clusters tests.test_production_pixel_quantization \
+            tests.test_paired_compatible_schema
         exec python3 scripts/simulation/higgs_portal_pilot.py "$@"
     ' bash "$@"

@@ -22,6 +22,13 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 
+try:
+    from scripts.postprocessing.utils import paired_schema as compat
+except ModuleNotFoundError as e:
+    if e.name != "scripts": raise
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.postprocessing.utils import paired_schema as compat
+
 NEW_COLOR = "#1672b8"
 PUBLIC_COLOR = "#df7926"
 PILEUP_COLORS = {"pu0": NEW_COLOR, "pu200": "#26966b"}
@@ -31,7 +38,7 @@ METHOD_LABELS = {"native": "Native activation", "empirical": "Empirical ATLAS ma
                  "linear_ATLAS": "Linear ATLAS-tail", "linear_P99.9": "Linear P99.9",
                  "linear_P99.5": "Linear P99.5", "linear_P99": "Linear P99"}
 METHOD_MARKERS = dict(zip(METHOD_COLORS, ("o", "s", "^", "D", "v", "P")))
-MEASUREMENT_KEY = ["campaign", "dataset", "version", "run", "local_event", "measurement_id"]
+MEASUREMENT_KEY = ["campaign", "dataset", "version", "run", "event_id", "measurement_id"]
 PARTICLE_FIELDS = ("pdg_id", "mass", "energy", "charge", "vx", "vy", "vz",
                    "time", "px", "py", "pz", "perigee_d0", "perigee_z0",
                    "vertex_primary", "parent_id", "primary")
@@ -85,17 +92,14 @@ def _published_shard(root: Path, sample: str, kind: str, event: int) -> Path:
 
 
 def _flat_event(path: Path, event: int) -> pa.Table:
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return ds.dataset(path, format="parquet").to_table(filter=ds.field("local_event") == event)
+    return compat.read_event(path, event)
 
 
 def load_event(new_root: Path, published_root: Path, sample: str = "pu0",
                new_event: int = 0, published_event: int = 0) -> EventData:
     if sample not in {"pu0", "pu200"}:
         raise ValueError("sample must be 'pu0' or 'pu200'")
-    folder = Path(new_root) / sample
-    paths = {kind: folder / f"{kind}.parquet" for kind in ("particles", "hits", "cells")}
+    paths, report_path = compat.resolve_sample(new_root, sample, new_event)
     public_paths = {kind: _published_shard(Path(published_root), sample, kind, published_event)
                     for kind in ("particles", "tracker_hits")}
     particles = _event_row(paths["particles"], new_event)
@@ -106,8 +110,8 @@ def load_event(new_root: Path, published_root: Path, sample: str = "pu0",
     if new_hits.num_rows == 0 or cells.num_rows == 0:
         raise ValueError(f"New {sample} event {new_event} has no hits or cells")
     import json
-    report = json.loads((folder / "report.json").read_text())
-    expected = {"particles": report["events"], "hits": report["measurements"],
+    report = json.loads(report_path.read_text())
+    expected = {"particles": report["events"], "hits": report["events"] if compat.SCHEMA_KEY in (pq.read_schema(paths["hits"]).metadata or {}) else report["measurements"],
                 "cells": report["cells"]}
     for kind, path in paths.items():
         rows = pq.read_metadata(path).num_rows
@@ -135,7 +139,7 @@ def _geom(table: pa.Table, shift: int, mask: int) -> np.ndarray:
 
 def _new_hit_feature(data: EventData, name: str) -> np.ndarray:
     if name in {"x", "y", "z"}:
-        return _arrow_values(data.new_hits, f"global_{name}")
+        return _arrow_values(data.new_hits, name)
     if name == "volume_id":
         return _geom(data.new_hits, 56, 0xff)
     if name == "layer_id":
@@ -206,9 +210,10 @@ def feature_coverage(data: EventData) -> pd.DataFrame:
     particle_old = set(data.public_schemas["particles"].names)
     hit_new = set(data.new_schemas["hits"].names)
     hit_old = set(data.public_schemas["tracker_hits"].names)
-    mapped = {"x": "global_x", "y": "global_y", "z": "global_z",
-              "volume_id": "geometry_id", "layer_id": "geometry_id",
-              "surface_id": "geometry_id"}
+    mapped = {}
+    if "global_x" in hit_new:
+        mapped = {"x":"global_x", "y":"global_y", "z":"global_z",
+                  "volume_id":"geometry_id", "layer_id":"geometry_id", "surface_id":"geometry_id"}
     for name in sorted(particle_new | particle_old):
         mode = "ID/integrity" if name in {"event_id", "particle_id", "parent_id"} else (
             "overlay" if name in particle_new & particle_old else "new only" if name in particle_new else "published only")
@@ -220,13 +225,13 @@ def feature_coverage(data: EventData) -> pd.DataFrame:
         rows.append(("hits", name, new_name if new_name in hit_new else "", name, mode))
     covered = {mapped.get(name, name) for name in hit_old}
     for name in sorted(hit_new - covered):
-        mode = "ID/integrity" if name in {"campaign", "dataset", "version", "run", "local_event",
+        mode = "ID/integrity" if name in {"campaign", "dataset", "version", "run", "event_id",
                                            "measurement_id", "geometry_id", "converted_particle_id", "simhit_ids",
                                            "unresolved_simhit_ids", "particle_ids"} else "new only"
         rows.append(("hits", name, name, "", mode))
     for name in data.new_schemas["cells"].names:
         rows.append(("cells", name, name, "", "ID/integrity" if name in {
-            "campaign", "dataset", "version", "run", "local_event", "measurement_id", "geometry_id"} else "new only"))
+            "campaign", "dataset", "version", "run", "event_id", "measurement_id", "geometry_id"} else "new only"))
     return pd.DataFrame(rows, columns=["Table", "Feature", "New column", "Published column", "Treatment"])
 
 
@@ -347,11 +352,17 @@ def plot_hits(data: EventData, scatter_limit: int = 10000, seed: int = 7) -> Non
           "Hits: geometry categories")
     _overlay_hit_labels(data)
     _plot_spatial(data, scatter_limit, seed)
-    _grid(["true_x", "true_y", "true_z", "time", "detector"],
-          lambda ax, name: _single(ax, data.public_hits[name],
-                                   f"Published only: {name}", PUBLIC_COLOR,
-                                   categorical=name == "detector", log_y=name == "time"),
-          "Published hit-only fields")
+    truth_fields = ["true_x", "true_y", "true_z", "time", "detector"]
+    comparable = [name for name in truth_fields if name in data.new_hits.column_names]
+    if comparable:
+        _grid(comparable, lambda ax, name: _overlay(ax, _new_hit_feature(data, name),
+              data.public_hits[name], f"Legacy truth: {name}", categorical=name == 'detector',
+              log_y=name == 'time'), "Hits: legacy truth summaries (not complete contributor truth)")
+    published_only = [name for name in truth_fields if name not in comparable]
+    if published_only:
+        _grid(published_only, lambda ax, name: _single(ax, data.public_hits[name],
+              f"Published only: {name}", PUBLIC_COLOR, categorical=name == 'detector',
+              log_y=name == 'time'), "Published hit-only fields")
     _grid(["local0", "local1", "simhit_count", "particle_count", "unresolved_count",
            "truth_complete", "converted_label_present"],
           lambda ax, name: _single(ax, _new_hit_only(data, name),
@@ -591,6 +602,8 @@ def missingness(data: EventData) -> pd.DataFrame:
             add("particles", name, "New", data.new_particles[name])
     for name in ("true_x", "true_y", "true_z", "time", "detector"):
         add("hits", name, "Published", data.public_hits[name])
+        if name in data.new_hits.column_names:
+            add("hits", name, "New", data.new_hits[name].to_pylist())
     for name in ("local0", "local1", "converted_particle_id", "particle_ids_complete"):
         add("hits", name, "New", data.new_hits[name].to_pylist())
     for name in ("channel0", "channel1", "value"):
@@ -630,7 +643,7 @@ def build_cluster_analysis(hits: pa.Table, cells: pa.Table, sample: str,
     if not np.isfinite(threshold) or threshold < 0:
         raise ValueError("The diagnostic tail threshold must be finite and nonnegative")
     for table in (hits, cells):
-        if set(table["local_event"].to_pylist()) != {event}:
+        if set(table["event_id"].to_pylist()) != {event}:
             raise ValueError("Analysis inputs must contain only the selected local event")
     metadata = hits.select(MEASUREMENT_KEY + ["geometry_id", "particle_ids_complete"]).to_pandas()
     metadata = metadata.rename(columns={"geometry_id": "hit_geometry_id",
@@ -686,9 +699,9 @@ def load_pileup_comparison(new_root: Path, event: int = 0,
     """Read only one selected event at each pileup setting, without public files."""
     result = {}
     for sample in PILEUP_COLORS:
-        folder = Path(new_root) / sample
-        hits = _flat_event(folder / "hits.parquet", event)
-        cells = _flat_event(folder / "cells.parquet", event)
+        paths, _ = compat.resolve_sample(new_root, sample, event)
+        hits = _flat_event(paths["hits"], event)
+        cells = _flat_event(paths["cells"], event)
         if not hits.num_rows or not cells.num_rows:
             raise ValueError(f"{sample}: no hits/cells for selected event {event}")
         result[sample] = build_cluster_analysis(hits, cells, sample, event, threshold)
@@ -712,7 +725,7 @@ def contributor_statistics(analyses: dict[str, ClusterAnalysis]) -> pd.DataFrame
                 cluster_tail_fraction=("above_tail", "mean"))
         table = cells.join(clusters, validate="one_to_one").reset_index()
         table.insert(0, "sample", sample)
-        table.insert(1, "local_event", analysis.event)
+        table.insert(1, "event_id", analysis.event)
         table["diagnostic_threshold"] = analysis.threshold
         tables.append(table)
     return pd.concat(tables, ignore_index=True)
@@ -726,7 +739,7 @@ def pileup_event_summary(analyses: dict[str, ClusterAnalysis]) -> pd.DataFrame:
             tail = cells[cells["above_tail"]]
             complete_tail = tail[tail["truth_complete"]]
             maximum = cells.loc[cells["value"].idxmax()]
-            rows.append({"sample": sample, "local_event": analysis.event, "detector_type": detector,
+            rows.append({"sample": sample, "event_id": analysis.event, "detector_type": detector,
                          "clusters": len(clusters), "cells": len(cells),
                          "incomplete_clusters": int((~clusters["truth_complete"]).sum()),
                          "maximum_activation": cells["value"].max(),
@@ -1250,13 +1263,24 @@ def pixel_calibration_values(root: Path, event=0):
 
 
 def _pixel_event_table(root, sample, kind, event, columns=None):
-    path = Path(root) / sample / f"{kind}.parquet"
-    selection = ((ds.field("local_event") == event)
-                 & (ds.field("geometry_id") >= pa.scalar(16 << 56, type=pa.uint64()))
-                 & (ds.field("geometry_id") < pa.scalar(19 << 56, type=pa.uint64())))
-    table = ds.dataset(path, format="parquet").to_table(columns=columns, filter=selection)
-    if not len(table):
-        raise ValueError(f"{sample}: event {event} has no pixel {kind}")
+    path = Path(root) / sample / (kind + ".parquet")
+    if not path.is_file():
+        paths, _ = compat.resolve_sample(root, sample, event)
+        path = paths[kind]
+    physical = pq.read_schema(path)
+    nested = 'measurement_id' in physical.names and pa.types.is_list(physical.field('measurement_id').type)
+    if not nested:
+        event_column = 'event_id' if 'event_id' in physical.names else 'local_event'
+        selection = ((ds.field(event_column) == event) &
+            (ds.field('geometry_id') >= pa.scalar(16 << 56, pa.uint64())) &
+            (ds.field('geometry_id') < pa.scalar(19 << 56, pa.uint64())))
+        table = compat.canonical_flat(ds.dataset(path).to_table(columns=columns, filter=selection))
+    else:
+        table = _flat_event(path, event)
+        volume = table['geometry_id'].to_numpy() >> 56
+        table = table.filter(pa.array((volume >= 16) & (volume <= 18)))
+        if columns: table = table.select(columns)
+    if not len(table): raise ValueError(f"{sample}: event {event} has no pixel {kind}")
     return table
 
 
@@ -1533,17 +1557,13 @@ def plot_multievent_empirical(calibration, validation, atlas_reference):
 
 
 def quantization_source_checksums(root: Path):
-    """Hash the six source Parquets before/after this in-memory analysis."""
-    result = {}
-    for sample in PILEUP_COLORS:
-        for name in ("hits", "cells", "particles"):
-            path = Path(root) / sample / f"{name}.parquet"
-            digest = hashlib.sha256()
-            with path.open("rb") as source:
-                for block in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(block)
-            result[str(path)] = digest.hexdigest()
-    return result
+    root = Path(root)
+    if (root / 'manifest.json').is_file():
+        m = json.loads((root / 'manifest.json').read_text())
+        paths = [root / f['path'] for shard in m['shards'] for tables in shard['files'].values() for f in tables.values()]
+    else:
+        paths = [root / sample / (kind + '.parquet') for sample in PILEUP_COLORS for kind in ('hits','cells','particles')]
+    return {str(path): compat.sha256(path) for path in paths}
 
 
 def plot_atlas_code_reference(reference):
@@ -1600,7 +1620,7 @@ def plot_pixel_quantization(study, atlas_reference, show_continuous=False):
                     continue
                 support, counts = np.unique(distances, return_counts=True)
                 axes[index].step(support, np.cumsum(counts[::-1])[::-1] / counts.sum(),
-                                 where="post", color=color, label=f"{sample}, event {study.clusters[sample].local_event.iloc[0]}")
+                                 where="post", color=color, label=f"{sample}, event {study.clusters[sample].event_id.iloc[0]}")
         if not continuous:
             for cohort, style in (("calibration", ":"), ("held_out", "--")):
                 hist = atlas_reference["histograms"][cohort]
@@ -1649,7 +1669,7 @@ def plot_quantization_examples(study, variant="empirical", per_sample=3):
             record.update(sample=sample, cells=len(selected), displacement=distances[cluster_index],
                           contributor_group=cluster.contributor_group)
             records.append(record)
-            axes[row, 0].set_title(f"{sample} event {cluster.local_event}, measurement {cluster.measurement_id}\nNative activation")
+            axes[row, 0].set_title(f"{sample} event {cluster.event_id}, measurement {cluster.measurement_id}\nNative activation")
             axes[row, 1].set_title(f"{variant}; shift {distances[cluster_index]:.4g} channels")
         plt.show()
     return pd.DataFrame(records)
@@ -1661,7 +1681,7 @@ def plot_campaign_examples(root, calibration, validation, per_sample=2):
     for sample in validation.events["sample"].unique():
         examples = validation.largest_shifts.query("sample == @sample and cohort == 'held_out'").head(per_sample)
         for example in examples.to_dict("records"):
-            analysis = load_pixel_analysis(root, sample, int(example["local_event"]))
+            analysis = load_pixel_analysis(root, sample, int(example["event_id"]))
             mask = np.ones(len(analysis.cells), dtype=bool)
             cluster_mask = np.ones(len(analysis.clusters), dtype=bool)
             for key in MEASUREMENT_KEY:
@@ -1729,7 +1749,7 @@ class RootMeasurementTruth:
         selected = arrays["event_nr"] == event
         frame = pd.DataFrame({name: arrays[name][selected] for name in self.fields})
         frame["measurement_id"] = np.arange(len(frame), dtype=np.uint64)
-        frame["local_event"] = event
+        frame["event_id"] = event
         return frame.drop(columns="event_nr")
 
 
@@ -1836,10 +1856,15 @@ def run_pixel_residual_study(root, empirical, linear, atlas_reference, digi_conf
                     analysis.clusters, on=MEASUREMENT_KEY, validate="one_to_one", sort=False)
                 if clusters.run.nunique() != 1 or clusters.measurement_id.duplicated().any():
                     raise ValueError("A single ROOT truth path supports only one run per sample")
-                truth = truth_loader(sample, event) if truth_loader else readers[sample].read(event)
+                if truth_loader:
+                    truth = truth_loader(sample, event)
+                else:
+                    paths, _ = compat.resolve_sample(root, sample, event)
+                    truth = readers[sample].read(compat.source_event(paths['hits'], event))
+                    truth['event_id'] = event
                 truth = truth.rename(columns={name: f"root_{name}" for name in truth.columns
-                                               if name not in ("local_event", "measurement_id")})
-                aligned = clusters.merge(truth, on=["local_event", "measurement_id"], how="left",
+                                               if name not in ("event_id", "measurement_id")})
+                aligned = clusters.merge(truth, on=["event_id", "measurement_id"], how="left",
                                           validate="one_to_one", indicator=True, sort=False)
                 if not (aligned._merge == "both").all():
                     raise ValueError(f"{sample} event {event}: missing ROOT measurement alignment")
@@ -2265,7 +2290,7 @@ def plot_linear_scan_examples(root, empirical, scan, study, variants=None, per_s
         for sample in PILEUP_COLORS:
             examples = study.largest_shifts.query("sample == @sample and variant == @variant").head(per_sample)
             for example in examples.to_dict("records"):
-                analysis = load_pixel_analysis(root, sample, int(example["local_event"]))
+                analysis = load_pixel_analysis(root, sample, int(example["event_id"]))
                 mask = np.ones(len(analysis.cells), dtype=bool)
                 cluster_mask = np.ones(len(analysis.clusters), dtype=bool)
                 for key in MEASUREMENT_KEY:
@@ -2547,7 +2572,7 @@ def validate_stored_pixel_codes(encoded_root, native_root, expected_scheme="p99.
         pixels_total = nonpixels_total = clipped = cells_total = 0
         seen_events = set()
         for batch in new.iter_batches(batch_size=batch_size,
-                columns=["local_event", "geometry_id", "value", "pixel_code"]):
+                columns=[("event_id" if "event_id" in new.schema_arrow.names else "local_event"), "geometry_id", "value", "pixel_code"]):
             values = batch.column("value").to_numpy()
             geometry = batch.column("geometry_id").to_numpy()
             codes = batch.column("pixel_code")
@@ -2566,7 +2591,7 @@ def validate_stored_pixel_codes(encoded_root, native_root, expected_scheme="p99.
             nonpixels_total += int((~pixels).sum())
             clipped += int(np.count_nonzero(values[pixels] >= clip_edge))
             cells_total += batch.num_rows
-            seen_events.update(np.unique(batch.column("local_event").to_numpy()).tolist())
+            seen_events.update(np.unique(batch.column("event_id" if "event_id" in batch.schema.names else "local_event").to_numpy()).tolist())
         expected_counts = {str(code): int(histogram[code]) for code in range(1, 16)}
         if pixels_total == 0:
             raise ValueError(f"{sample}: no pixel cells available for code validation")
